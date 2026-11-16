@@ -2,12 +2,18 @@
 
 Run from backend: python -m tests.preview
 Never loads the real database or sends OpenAI requests.
+
+Fictional sign-in accounts exist only in the temporary preview database:
+  preview-admin / preview-password  (admin)
+  preview-viewer / preview-password (viewer, read-only)
 """
 import os
 import tempfile
 from pathlib import Path
 
 import uvicorn
+
+PREVIEW_PASSWORD = "preview-password"
 
 
 def main():
@@ -21,7 +27,10 @@ def main():
         from fastapi.middleware.cors import CORSMiddleware
         api.app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5174"],
                                allow_methods=["*"], allow_headers=["*"])
+        from app.auth import hash_password
         with SessionLocal() as db:
+            for username, role in [("preview-admin", "admin"), ("preview-viewer", "viewer")]:
+                db.add(models.User(username=username, role=role, password_hash=hash_password(PREVIEW_PASSWORD)))
             system = models.System(name="Northstar UI Test (isolated)", owner="Test Analyst", environment="Test")
             control = models.SystemControl(code="AC-2", name="Account Management", family="Access Control",
                                            description="Document approvals and periodic account review.")

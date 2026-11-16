@@ -2,10 +2,15 @@ import { useMemo, useState } from "react";
 import { useNavigate } from "react-router";
 
 import { useSystems } from "../context/systems-context";
+import { useAuth } from "../context/auth-context";
+import { openEvidenceFile } from "../services/api";
 import InfoTooltip from "../components/InfoTooltip";
+import EvidenceSearch from "../components/EvidenceSearch";
 
 function Evidence() {
   const navigate = useNavigate();
+
+  const { canEdit } = useAuth();
 
   const {
     systems,
@@ -13,6 +18,9 @@ function Evidence() {
   } = useSystems();
 
   const [searchTerm, setSearchTerm] =
+    useState("");
+
+  const [message, setMessage] =
     useState("");
 
   /*
@@ -71,29 +79,18 @@ function Evidence() {
    * View file
    */
   function handleViewEvidence(evidence) {
-    if (!evidence.file) {
-      alert(
-        "This evidence file is no longer available in the current browser session."
+    openEvidenceFile(evidence.id).catch((error) => {
+      setMessage(
+        error.message ||
+          "This evidence file cannot be opened."
       );
-
-      return;
-    }
-
-    const fileUrl =
-      URL.createObjectURL(
-        evidence.file
-      );
-
-    window.open(
-      fileUrl,
-      "_blank"
-    );
+    });
   }
 
   /*
    * Delete file
    */
-  function handleDeleteEvidence(evidence) {
+  async function handleDeleteEvidence(evidence) {
     const confirmed =
       window.confirm(
         `Remove "${evidence.name}"?\n\nThis will remove the file from ${evidence.systemName} → ${evidence.controlCode}.`
@@ -103,10 +100,19 @@ function Evidence() {
       return;
     }
 
-    removeEvidenceFromControl(
-      evidence.systemId,
-      evidence.controlCode,
-      evidence.id
+    setMessage("");
+
+    const success =
+      await removeEvidenceFromControl(
+        evidence.systemId,
+        evidence.controlCode,
+        evidence.id
+      );
+
+    setMessage(
+      success
+        ? `Removed "${evidence.name}".`
+        : `"${evidence.name}" could not be removed.`
     );
   }
 
@@ -118,7 +124,7 @@ function Evidence() {
     evidence
   ) {
     navigate(
-      `/systems/${evidence.systemId}/controls/${evidence.controlCode}`
+      `/systems/${evidence.systemId}/controls/${encodeURIComponent(evidence.controlCode)}`
     );
   }
 
@@ -198,6 +204,15 @@ function Evidence() {
         </div>
       </div>
 
+      {message && (
+        <div
+          className="assessment-message"
+          role="status"
+        >
+          {message}
+        </div>
+      )}
+
       <div className="evidence-summary-grid">
         <div className="summary-box">
           <span>
@@ -230,6 +245,10 @@ function Evidence() {
         </div>
       </div>
 
+      {allEvidence.length > 0 && (
+        <EvidenceSearch systems={systems} />
+      )}
+
       <div className="panel evidence-library-panel">
         <div className="evidence-library-header">
           <div>
@@ -247,7 +266,8 @@ function Evidence() {
             <input
               type="text"
               className="evidence-search-input"
-              placeholder="Search evidence..."
+              placeholder="Filter by file, system, or control..."
+              aria-label="Filter the list by file name, system, or control"
               value={searchTerm}
               onChange={(event) =>
                 setSearchTerm(
@@ -420,17 +440,20 @@ function Evidence() {
                             Assessment
                           </button>
 
-                          <button
-                            className="delete-control-button"
-                            title="Remove evidence"
-                            onClick={() =>
-                              handleDeleteEvidence(
-                                evidence
-                              )
-                            }
-                          >
-                            🗑
-                          </button>
+                          {canEdit && (
+                            <button
+                              className="delete-control-button"
+                              title="Remove evidence"
+                              aria-label={`Remove ${evidence.name}`}
+                              onClick={() =>
+                                handleDeleteEvidence(
+                                  evidence
+                                )
+                              }
+                            >
+                              🗑
+                            </button>
+                          )}
                         </div>
                       </td>
                     </tr>

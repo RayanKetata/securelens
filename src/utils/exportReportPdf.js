@@ -2,6 +2,7 @@ import { jsPDF } from "jspdf";
 import autoTable from "jspdf-autotable";
 
 import secureLensLogo from "../assets/Securelens-logo.png";
+import { buildRiskSummary } from "./riskSummary";
 
 function loadImage(url) {
   return new Promise((resolve) => {
@@ -48,6 +49,24 @@ export async function exportSystemReport(system) {
   const pageWidth = doc.internal.pageSize.getWidth();
 
   const margin = 14;
+
+  // Draws a bold heading, starting a new page when too close to the
+  // bottom. Returns the y position the heading was drawn at.
+  function sectionHeading(title, y, size = 12) {
+    let headingY = y;
+
+    if (headingY > doc.internal.pageSize.getHeight() - 30) {
+      doc.addPage();
+      headingY = 20;
+    }
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(size);
+    doc.setTextColor(0, 0, 0);
+    doc.text(title, margin, headingY);
+
+    return headingY;
+  }
 
   /*
    * COUNTS
@@ -292,23 +311,100 @@ export async function exportSystemReport(system) {
   });
 
   /*
+   * RISK SUMMARY
+   */
+
+  const summary = buildRiskSummary(system);
+
+  const textTable = (startY, rows, options = {}) =>
+    autoTable(doc, {
+      startY,
+      body: rows.map((row) => [row]),
+      theme: "plain",
+      styles: {
+        fontSize: 8.5,
+        cellPadding: { top: 1, bottom: 1, left: 0, right: 0 },
+        overflow: "linebreak",
+      },
+      margin: { left: margin, right: margin, bottom: 15 },
+      ...options,
+    });
+
+  const riskY = sectionHeading(
+    `Risk Summary (${summary.rating})`,
+    doc.lastAutoTable.finalY + 9
+  );
+
+  textTable(riskY + 3, [summary.headline], {
+    styles: {
+      fontSize: 10,
+      fontStyle: "bold",
+      cellPadding: { top: 1, bottom: 2, left: 0, right: 0 },
+      overflow: "linebreak",
+    },
+  });
+
+  if (summary.points.length) {
+    textTable(
+      doc.lastAutoTable.finalY + 1,
+      summary.points.map((point) => `•  ${point}`)
+    );
+  }
+
+  if (summary.priorities.length) {
+    autoTable(doc, {
+      startY: doc.lastAutoTable.finalY + 4,
+      head: [["Priority Gap", "Status", "Finding", "Evidence Files"]],
+      body: summary.priorities.map((gap) => [
+        `${gap.code}\n${gap.name}`,
+        gap.status,
+        gap.finding,
+        String(gap.evidenceCount),
+      ]),
+      theme: "grid",
+      styles: {
+        fontSize: 7.5,
+        cellPadding: 2.5,
+        valign: "top",
+        overflow: "linebreak",
+      },
+      columnStyles: {
+        0: { cellWidth: 50 },
+        1: { cellWidth: 28 },
+        3: { cellWidth: 25, halign: "center" },
+      },
+      headStyles: { fontStyle: "bold" },
+      margin: { left: margin, right: margin, bottom: 15 },
+    });
+  }
+
+  const stepsY = sectionHeading(
+    "Recommended Next Steps",
+    doc.lastAutoTable.finalY + 7,
+    10
+  );
+
+  textTable(
+    stepsY + 2,
+    summary.nextSteps.map((step, index) => `${index + 1}.  ${step}`)
+  );
+
+  textTable(doc.lastAutoTable.finalY + 1, [summary.caveats.join(" ")], {
+    styles: {
+      fontSize: 7,
+      textColor: [100, 100, 100],
+      cellPadding: { top: 1, bottom: 1, left: 0, right: 0 },
+      overflow: "linebreak",
+    },
+  });
+
+  /*
    * CONTROL DETAILS
    */
 
-  const controlsY =
-    doc.lastAutoTable.finalY + 9;
-
-  doc.setFont(
-    "helvetica",
-    "bold"
-  );
-
-  doc.setFontSize(12);
-
-  doc.text(
+  const controlsY = sectionHeading(
     "Control Assessment Details",
-    margin,
-    controlsY
+    doc.lastAutoTable.finalY + 9
   );
 
   const controlRows =
@@ -403,33 +499,6 @@ export async function exportSystemReport(system) {
       right: margin,
       bottom: 15,
     },
-
-    didDrawPage: () => {
-      const pageHeight =
-        doc.internal.pageSize.getHeight();
-
-      doc.setFont(
-        "helvetica",
-        "normal"
-      );
-
-      doc.setFontSize(7);
-
-      doc.text(
-        "SecureLens Security Assessment Report",
-        margin,
-        pageHeight - 7
-      );
-
-      doc.text(
-        `Page ${doc.internal.getCurrentPageInfo().pageNumber}`,
-        pageWidth - margin,
-        pageHeight - 7,
-        {
-          align: "right",
-        }
-      );
-    },
   });
 
   /*
@@ -462,6 +531,32 @@ export async function exportSystemReport(system) {
       ),
       margin,
       finalY
+    );
+  }
+
+  /*
+   * PAGE FOOTERS (every page, including ones added by long sections)
+   */
+
+  const pageCount = doc.getNumberOfPages();
+
+  for (let page = 1; page <= pageCount; page += 1) {
+    doc.setPage(page);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(7);
+    doc.setTextColor(0, 0, 0);
+
+    doc.text(
+      "SecureLens Security Assessment Report",
+      margin,
+      pageHeight - 7
+    );
+
+    doc.text(
+      `Page ${page} of ${pageCount}`,
+      pageWidth - margin,
+      pageHeight - 7,
+      { align: "right" }
     );
   }
 

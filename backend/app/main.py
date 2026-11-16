@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 from uuid import uuid4
 
@@ -6,19 +7,50 @@ from fastapi import (
     FastAPI,
     File,
     HTTPException,
+    Query,
+    Request,
     UploadFile,
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from starlette.concurrency import run_in_threadpool
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
-from .database import Base, engine, get_db
-from .evidence_text import extract_text_from_file
+from .activity import control_label, record_activity
+from .config import settings
+from .database import engine, get_db
+from .migrate import upgrade_database
+from .evidence_text import (
+    IMAGE_FORMATS,
+    ExtractionResult,
+    InvalidImageError,
+    extract_evidence_text,
+    validate_image,
+)
+from .ocr import ocr_available
+from .search import parse_terms, search_evidence
 from .ai_assessment import AIServiceError, analyze_control_evidence
+from .auth import (
+    authenticate,
+    create_session,
+    get_current_token,
+    hash_password,
+    login_throttle,
+    require_admin,
+    require_editor,
+    require_user,
+    revoke_other_sessions,
+    revoke_session,
+    too_many_attempts,
+    verify_password,
+)
 from . import models, schemas
+
+
+logger = logging.getLogger("securelens")
 
 
 # ---------------------------------------------------------
@@ -46,6 +78,22 @@ ALLOWED_FILE_TYPES = {
         "text/plain",
         "application/octet-stream",
     },
+    # Images are also checked by content (validate_image) and served
+    # with the type found in the file, not the one the browser sent.
+    ".png": {
+        "image/png",
+        "application/octet-stream",
+    },
+    ".jpg": {
+        "image/jpeg",
+        "image/pjpeg",
+        "application/octet-stream",
+    },
+    ".jpeg": {
+        "image/jpeg",
+        "image/pjpeg",
+        "application/octet-stream",
+    },
 }
 
 
@@ -63,15 +111,16 @@ app = FastAPI(
 )
 
 
-Base.metadata.create_all(bind=engine)
+# Apply pending schema migrations (see backend/migrations). Set
+# AUTO_MIGRATE=false to run `alembic upgrade head` yourself instead,
+# for example when several server processes start at once.
+if settings.auto_migrate:
+    upgrade_database(engine)
 
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=settings.cors_origin_list,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -239,12 +288,378 @@ def root():
     }
 
 
-@app.get("/health")
+@app.get(
+    "/health",
+    response_model=schemas.HealthResponse,
+)
 def health_check():
+    # Reports only whether a key is configured, never the key itself.
     return {
         "status": "healthy",
         "service": "SecureLens API",
+        "aiConfigured": bool(settings.openai_api_key),
+        "aiModel": settings.openai_model,
+        "ocrAvailable": ocr_available(),
     }
+
+
+# ---------------------------------------------------------
+# AUTHENTICATION
+# ---------------------------------------------------------
+
+def client_address(http_request: Request) -> str:
+    # Behind a reverse proxy this is the proxy's address; run uvicorn
+    # with --proxy-headers so the real client address is used.
+    return http_request.client.host if http_request.client else "unknown"
+
+
+def count_users(db: Session) -> int:
+    return db.scalar(
+        select(func.count()).select_from(models.User)
+    )
+
+
+def login_response(db: Session, user: models.User):
+    token, expires_at = create_session(db, user)
+
+    return {
+        "token": token,
+        "expiresAt": expires_at,
+        "user": user,
+    }
+
+
+@app.get(
+    "/auth/status",
+    response_model=schemas.AuthStatusResponse,
+)
+def auth_status(
+    db: Session = Depends(get_db),
+):
+    return {
+        "setupRequired": count_users(db) == 0,
+    }
+
+
+@app.post(
+    "/auth/setup",
+    response_model=schemas.LoginResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def setup_first_admin(
+    request: schemas.SetupRequest,
+    http_request: Request,
+    db: Session = Depends(get_db),
+):
+    # Only allowed while the database has no users at all.
+    if count_users(db) > 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Setup is already complete. Sign in instead.",
+        )
+
+    user = models.User(
+        username=request.username,
+        password_hash=hash_password(request.password),
+        role="admin",
+    )
+
+    db.add(user)
+    db.flush()
+    record_activity(
+        db, user, "auth.setup",
+        f"Created the first admin account {user.username}",
+        client=client_address(http_request),
+    )
+    db.commit()
+    db.refresh(user)
+
+    return login_response(db, user)
+
+
+@app.post(
+    "/auth/login",
+    response_model=schemas.LoginResponse,
+)
+def login(
+    request: schemas.LoginRequest,
+    http_request: Request,
+    db: Session = Depends(get_db),
+):
+    username = request.username.strip()
+    client = client_address(http_request)
+
+    # Checked before the password so a blocked guesser learns nothing.
+    wait = login_throttle.retry_after(client, username)
+    if wait:
+        raise too_many_attempts(wait)
+
+    user = authenticate(db, username, request.password)
+
+    if user is None:
+        login_throttle.record_failure(client, username)
+        record_activity(
+            db, None, "auth.login_failed",
+            f"Failed sign-in for username \"{username[:80]}\"",
+            actor_name=username,
+            client=client,
+        )
+        db.commit()
+        # Same message for unknown users and wrong passwords.
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password.",
+        )
+
+    login_throttle.record_success(client, username)
+    record_activity(db, user, "auth.login", "Signed in", client=client)
+    return login_response(db, user)
+
+
+@app.post(
+    "/auth/logout",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def logout(
+    token: str = Depends(get_current_token),
+    db: Session = Depends(get_db),
+):
+    revoke_session(db, token)
+    return None
+
+
+@app.get(
+    "/auth/me",
+    response_model=schemas.UserResponse,
+)
+def current_user_profile(
+    current_user: models.User = Depends(require_user),
+):
+    return current_user
+
+
+@app.post(
+    "/auth/password",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def change_own_password(
+    request: schemas.PasswordChange,
+    http_request: Request,
+    token: str = Depends(get_current_token),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_user),
+):
+    client = client_address(http_request)
+
+    # A stolen session must not be usable to guess the password.
+    wait = login_throttle.retry_after(client, current_user.username)
+    if wait:
+        raise too_many_attempts(wait)
+
+    if not verify_password(request.currentPassword, current_user.password_hash):
+        login_throttle.record_failure(client, current_user.username)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Your current password is incorrect.",
+        )
+
+    if request.newPassword == request.currentPassword:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Choose a new password that differs from the current one.",
+        )
+
+    current_user.password_hash = hash_password(request.newPassword)
+    # Keep this browser signed in; sign out everywhere else.
+    revoke_other_sessions(db, current_user, token)
+    record_activity(
+        db, current_user, "auth.password_change",
+        "Changed their own password", client=client,
+    )
+    db.commit()
+
+    login_throttle.record_success(client, current_user.username)
+    return None
+
+
+# ---------------------------------------------------------
+# USERS (ADMIN)
+# ---------------------------------------------------------
+
+def get_user_or_404(db: Session, user_id: int):
+    user = db.get(models.User, user_id)
+
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found",
+        )
+
+    return user
+
+
+def ensure_another_admin(db: Session, user: models.User):
+    if user.role != "admin":
+        return
+
+    admins = db.scalar(
+        select(func.count())
+        .select_from(models.User)
+        .where(models.User.role == "admin")
+    )
+
+    if admins <= 1:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="SecureLens must keep at least one admin.",
+        )
+
+
+@app.get(
+    "/users",
+    response_model=list[schemas.UserResponse],
+)
+def list_users(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_admin),
+):
+    return db.scalars(
+        select(models.User).order_by(models.User.id)
+    ).all()
+
+
+@app.post(
+    "/users",
+    response_model=schemas.UserResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_user(
+    request: schemas.UserCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_admin),
+):
+    exists = db.scalar(
+        select(models.User).where(
+            models.User.username == request.username
+        )
+    )
+
+    if exists is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="That username is already taken.",
+        )
+
+    user = models.User(
+        username=request.username,
+        password_hash=hash_password(request.password),
+        role=request.role,
+    )
+
+    db.add(user)
+    record_activity(
+        db, current_user, "user.create",
+        f"Created user {request.username} ({request.role})",
+    )
+    db.commit()
+    db.refresh(user)
+
+    return user
+
+
+@app.put(
+    "/users/{user_id}",
+    response_model=schemas.UserResponse,
+)
+def update_user(
+    user_id: int,
+    request: schemas.UserUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_admin),
+):
+    user = get_user_or_404(db, user_id)
+
+    if request.role is not None and request.role != user.role:
+        ensure_another_admin(db, user)
+        record_activity(
+            db, current_user, "user.update",
+            f"Changed {user.username}'s role from {user.role} to {request.role}",
+        )
+        user.role = request.role
+
+    if request.password is not None:
+        user.password_hash = hash_password(request.password)
+        record_activity(
+            db, current_user, "user.update",
+            f"Reset the password for {user.username}",
+        )
+        # A password reset signs the user out everywhere.
+        user.sessions.clear()
+
+    db.commit()
+    db.refresh(user)
+
+    return user
+
+
+@app.delete(
+    "/users/{user_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_admin),
+):
+    user = get_user_or_404(db, user_id)
+
+    if user.id == current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="You cannot delete your own account.",
+        )
+
+    ensure_another_admin(db, user)
+
+    record_activity(
+        db, current_user, "user.delete",
+        f"Deleted user {user.username} ({user.role})",
+    )
+    db.delete(user)
+    db.commit()
+
+    return None
+
+
+# ---------------------------------------------------------
+# ACTIVITY LOG (ADMIN)
+# ---------------------------------------------------------
+
+@app.get(
+    "/activity",
+    response_model=list[schemas.ActivityEventResponse],
+)
+def list_activity(
+    limit: int = Query(50, ge=1, le=200),
+    before: int | None = Query(None, ge=1),
+    category: str | None = Query(None, max_length=20, pattern=r"^[a-z]+$"),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_admin),
+):
+    """Newest first. Pass the last id you received as `before` for more."""
+    statement = select(models.ActivityEvent)
+
+    if before is not None:
+        statement = statement.where(models.ActivityEvent.id < before)
+
+    if category:
+        statement = statement.where(
+            models.ActivityEvent.action.startswith(category + ".")
+        )
+
+    return db.scalars(
+        statement.order_by(models.ActivityEvent.id.desc()).limit(limit)
+    ).all()
 
 
 # ---------------------------------------------------------
@@ -259,6 +674,7 @@ def health_check():
 def create_system(
     system: schemas.SystemCreate,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_editor),
 ):
     new_system = models.System(
         name=system.name,
@@ -271,6 +687,10 @@ def create_system(
     )
 
     db.add(new_system)
+    record_activity(
+        db, current_user, "system.create",
+        f"Created system \"{new_system.name}\"",
+    )
     db.commit()
     db.refresh(new_system)
 
@@ -285,6 +705,7 @@ def create_system(
 )
 def get_systems(
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_user),
 ):
     statement = (
         select(models.System)
@@ -312,6 +733,14 @@ def get_systems(
 def get_system(
     system_id: int,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_user),
+):
+    return load_system_with_controls(db, system_id)
+
+
+def load_system_with_controls(
+    db: Session,
+    system_id: int,
 ):
     statement = (
         select(models.System)
@@ -339,6 +768,44 @@ def get_system(
     return system
 
 
+@app.put(
+    "/systems/{system_id}",
+    response_model=schemas.SystemResponse,
+)
+def update_system(
+    system_id: int,
+    update: schemas.SystemUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_editor),
+):
+    system = get_system_or_404(
+        db,
+        system_id,
+    )
+
+    changes = update.model_dump(
+        exclude_unset=True,
+    )
+
+    for field in ("name", "owner", "environment"):
+        if changes.get(field) is None:
+            changes.pop(field, None)
+
+    if changes:
+        record_activity(
+            db, current_user, "system.update",
+            f"Updated system \"{system.name}\" ({', '.join(sorted(changes))})",
+        )
+
+    for field, value in changes.items():
+        setattr(system, field, value)
+
+    db.add(system)
+    db.commit()
+
+    return load_system_with_controls(db, system_id)
+
+
 @app.delete(
     "/systems/{system_id}",
     status_code=status.HTTP_204_NO_CONTENT,
@@ -346,6 +813,7 @@ def get_system(
 def delete_system(
     system_id: int,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_editor),
 ):
     statement = (
         select(models.System)
@@ -376,6 +844,11 @@ def delete_system(
                 evidence.stored_filename
             )
 
+    record_activity(
+        db, current_user, "system.delete",
+        f"Deleted system \"{system.name}\" and its "
+        f"{len(system.controls)} control(s)",
+    )
     db.delete(system)
     db.commit()
 
@@ -399,6 +872,7 @@ def add_controls(
         schemas.ControlCreate
     ],
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_editor),
 ):
     system = get_system_or_404(
         db,
@@ -448,6 +922,13 @@ def add_controls(
             control.code
         )
 
+    if created_controls:
+        record_activity(
+            db, current_user, "control.add",
+            f"Added {', '.join(c.code for c in created_controls)} "
+            f"to \"{system.name}\"",
+        )
+
     db.commit()
 
     for control in created_controls:
@@ -470,6 +951,7 @@ def add_controls(
 def get_controls(
     system_id: int,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_user),
 ):
     get_system_or_404(
         db,
@@ -506,6 +988,7 @@ def update_control_assessment(
     control_code: str,
     update: schemas.ControlUpdate,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_editor),
 ):
     system = get_system_or_404(
         db,
@@ -516,6 +999,12 @@ def update_control_assessment(
         db,
         system_id,
         control_code,
+    )
+
+    previous = (
+        control.status,
+        control.analyst_notes,
+        control.findings,
     )
 
     if update.status is not None:
@@ -531,6 +1020,34 @@ def update_control_assessment(
             update.findings
         )
 
+    # Record each saved change so decisions remain auditable.
+    if previous != (
+        control.status,
+        control.analyst_notes,
+        control.findings,
+    ):
+        db.add(
+            models.AssessmentHistory(
+                system_control_id=control.id,
+                previous_status=previous[0],
+                new_status=control.status,
+                analyst_notes=control.analyst_notes,
+                findings=control.findings,
+                changed_by_id=current_user.id,
+                changed_by=current_user.username,
+            )
+        )
+
+        if previous[0] != control.status:
+            change = f"{previous[0]} → {control.status}"
+        else:
+            change = "updated notes or findings"
+
+        record_activity(
+            db, current_user, "control.assess",
+            f"Saved {control_label(system, control)}: {change}",
+        )
+
     db.add(control)
     db.commit()
     db.refresh(control)
@@ -543,6 +1060,40 @@ def update_control_assessment(
     return control
 
 
+@app.get(
+    "/systems/{system_id}/controls/{control_code}/history",
+    response_model=list[
+        schemas.AssessmentHistoryResponse
+    ],
+)
+def get_control_history(
+    system_id: int,
+    control_code: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_user),
+):
+    control = get_control_or_404(
+        db,
+        system_id,
+        control_code,
+    )
+
+    statement = (
+        select(models.AssessmentHistory)
+        .where(
+            models.AssessmentHistory.system_control_id
+            == control.id
+        )
+        .order_by(
+            models.AssessmentHistory.id.desc()
+        )
+    )
+
+    return db.scalars(
+        statement
+    ).all()
+
+
 @app.delete(
     "/systems/{system_id}/controls/{control_code}",
     status_code=status.HTTP_204_NO_CONTENT,
@@ -551,6 +1102,7 @@ def remove_control(
     system_id: int,
     control_code: str,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_editor),
 ):
     system = get_system_or_404(
         db,
@@ -568,6 +1120,11 @@ def remove_control(
             evidence.stored_filename
         )
 
+    record_activity(
+        db, current_user, "control.remove",
+        f"Removed {control_label(system, control)} "
+        f"with {len(control.evidence)} evidence file(s)",
+    )
     db.delete(control)
     db.commit()
 
@@ -583,6 +1140,36 @@ def remove_control(
 # EVIDENCE
 # ---------------------------------------------------------
 
+def extract_or_fail(path: Path, suffix: str) -> ExtractionResult | None:
+    """Extracted text, or None if the file could not be processed."""
+    try:
+        return extract_evidence_text(path, suffix.lower())
+    except Exception:
+        logger.exception("Evidence extraction failed for %s", path.name)
+        return None
+
+
+def apply_extraction(evidence: models.Evidence, extraction: ExtractionResult | None):
+    if extraction is None:
+        evidence.extracted_text = None
+        evidence.extraction_status = "failed"
+        evidence.extraction_method = None
+        evidence.extraction_note = ""
+        return
+
+    evidence.extracted_text = extraction.text or None
+    evidence.extraction_status = "completed" if extraction.text else "empty"
+    evidence.extraction_method = extraction.method
+    evidence.extraction_note = extraction.note
+
+
+def describe_extraction(evidence: models.Evidence) -> str:
+    detail = f"text: {evidence.extraction_status}"
+    if evidence.extraction_method and evidence.extraction_method != "text":
+        detail += f", {evidence.extraction_method}"
+    return detail
+
+
 @app.post(
     "/systems/{system_id}/controls/{control_code}/evidence",
     response_model=schemas.EvidenceResponse,
@@ -593,8 +1180,9 @@ async def upload_evidence(
     control_code: str,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_editor),
 ):
-    get_system_or_404(
+    system = get_system_or_404(
         db,
         system_id,
     )
@@ -617,7 +1205,7 @@ async def upload_evidence(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
-                "Only PDF and TXT "
+                "Only PDF, TXT, PNG, and JPEG "
                 "evidence files are allowed."
             ),
         )
@@ -697,36 +1285,29 @@ async def upload_evidence(
         await file.close()
 
     # -----------------------------------------------------
+    # CHECK IMAGES ARE REAL IMAGES
+    # -----------------------------------------------------
+
+    if suffix in IMAGE_FORMATS:
+        try:
+            content_type = await run_in_threadpool(
+                validate_image, destination, suffix,
+            )
+        except InvalidImageError as error:
+            destination.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(error),
+            )
+
+    # -----------------------------------------------------
     # EXTRACT TEXT
     # -----------------------------------------------------
 
-    extracted_text = None
-    extraction_status = "pending"
-
-    try:
-        extracted_text = (
-            extract_text_from_file(
-                destination,
-                suffix,
-            )
-        )
-
-        if extracted_text:
-            extraction_status = (
-                "completed"
-            )
-        else:
-            extraction_status = (
-                "empty"
-            )
-
-    except Exception as error:
-        print(
-            "Evidence extraction failed:",
-            error,
-        )
-
-        extraction_status = "failed"
+    # OCR can take a while; run it off the event loop.
+    extraction = await run_in_threadpool(
+        extract_or_fail, destination, suffix,
+    )
 
     # -----------------------------------------------------
     # SAVE EVIDENCE TO DATABASE
@@ -738,12 +1319,16 @@ async def upload_evidence(
         stored_filename=stored_filename,
         content_type=content_type,
         file_size=total_size,
-        extracted_text=extracted_text,
-        extraction_status=extraction_status,
     )
+    apply_extraction(evidence, extraction)
 
     try:
         db.add(evidence)
+        record_activity(
+            db, current_user, "evidence.upload",
+            f"Uploaded \"{original_filename}\" to "
+            f"{control_label(system, control)} ({describe_extraction(evidence)})",
+        )
         db.commit()
         db.refresh(evidence)
 
@@ -768,6 +1353,7 @@ def get_control_evidence(
     system_id: int,
     control_code: str,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_user),
 ):
     control = get_control_or_404(
         db,
@@ -798,6 +1384,7 @@ def get_control_evidence(
 def get_evidence_text(
     evidence_id: int,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_user),
 ):
     evidence = db.get(
         models.Evidence,
@@ -814,11 +1401,84 @@ def get_evidence_text(
 
 
 @app.get(
+    "/evidence/search",
+    response_model=schemas.EvidenceSearchResponse,
+)
+def search_evidence_text(
+    q: str = Query(..., min_length=2, max_length=200),
+    system_id: int | None = Query(None, alias="systemId"),
+    limit: int = Query(20, ge=1, le=50),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_user),
+):
+    """Find evidence whose extracted text or filename has every term."""
+    terms = parse_terms(q)
+
+    if not terms:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Enter at least one search term of two or more characters.",
+        )
+
+    results, truncated = search_evidence(db, terms, system_id, limit)
+
+    return {
+        "terms": terms,
+        "results": results,
+        "truncated": truncated,
+    }
+
+
+@app.post(
+    "/evidence/{evidence_id}/extract",
+    response_model=schemas.EvidenceResponse,
+)
+async def reextract_evidence(
+    evidence_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_editor),
+):
+    """Run text extraction again, e.g. after OCR was installed."""
+    evidence = db.get(models.Evidence, evidence_id)
+
+    if evidence is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Evidence not found",
+        )
+
+    file_path = UPLOAD_DIR / evidence.stored_filename
+
+    if not file_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Evidence file is missing from storage",
+        )
+
+    extraction = await run_in_threadpool(
+        extract_or_fail, file_path, file_path.suffix,
+    )
+    apply_extraction(evidence, extraction)
+
+    record_activity(
+        db, current_user, "evidence.extract",
+        f"Re-ran text extraction for \"{evidence.original_filename}\" on "
+        f"{control_label(evidence.control.system, evidence.control)} "
+        f"({describe_extraction(evidence)})",
+    )
+    db.commit()
+    db.refresh(evidence)
+
+    return evidence
+
+
+@app.get(
     "/evidence/{evidence_id}/download"
 )
 def download_evidence(
     evidence_id: int,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_user),
 ):
     evidence = db.get(
         models.Evidence,
@@ -863,8 +1523,9 @@ def analyze_control(
     system_id: int,
     control_code: str,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_editor),
 ):
-    get_system_or_404(
+    system = get_system_or_404(
         db,
         system_id,
     )
@@ -910,21 +1571,40 @@ def analyze_control(
         )
 
     except AIServiceError as error:
+        record_activity(
+            db, current_user, "ai.analyze_failed",
+            f"AI analysis failed for {control_label(system, control)}: {error}",
+        )
+        db.commit()
         raise HTTPException(
             status_code=error.status_code,
             detail=str(error),
         )
 
-    except Exception as error:
-        print(
-            "AI assessment failed:",
-            error,
+    except Exception:
+        logger.exception(
+            "AI assessment failed for control %s",
+            control_code,
         )
+        record_activity(
+            db, current_user, "ai.analyze_failed",
+            f"AI analysis failed for {control_label(system, control)}",
+        )
+        db.commit()
 
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="AI assessment failed.",
         )
+
+    # Only the suggestion summary is logged; the analyst decides separately.
+    record_activity(
+        db, current_user, "ai.analyze",
+        f"AI suggested {result.suggestedStatus} ({result.confidence} "
+        f"confidence) for {control_label(system, control)} from "
+        f"{len(evidence_files)} file(s)",
+    )
+    db.commit()
 
     return schemas.AIAssessmentResponse(
         **result.model_dump(),
@@ -938,6 +1618,7 @@ def analyze_control(
 def delete_evidence(
     evidence_id: int,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_editor),
 ):
     evidence = db.get(
         models.Evidence,
@@ -954,6 +1635,11 @@ def delete_evidence(
         evidence.stored_filename
     )
 
+    record_activity(
+        db, current_user, "evidence.delete",
+        f"Deleted \"{evidence.original_filename}\" from "
+        f"{control_label(evidence.control.system, evidence.control)}",
+    )
     db.delete(evidence)
     db.commit()
 

@@ -5,14 +5,15 @@ import { BrowserRouter } from "react-router";
 import "./index.css";
 import App from "./App.jsx";
 
-import { SystemsProvider } from "./context/SystemsContext.jsx";
+import { AuthProvider } from "./context/AuthContext.jsx";
 
+// SystemsProvider is mounted inside App once a user is signed in.
 createRoot(document.getElementById("root")).render(
   <StrictMode>
     <BrowserRouter>
-      <SystemsProvider>
+      <AuthProvider>
         <App />
-      </SystemsProvider>
+      </AuthProvider>
     </BrowserRouter>
   </StrictMode>
 );

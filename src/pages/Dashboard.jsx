@@ -1,10 +1,13 @@
 import { useMemo, useState } from "react";
 import { useNavigate } from "react-router";
 import { useSystems } from "../context/systems-context";
+import { useAuth } from "../context/auth-context";
 
 
 function Dashboard() {
   const navigate = useNavigate();
+
+  const { canEdit } = useAuth();
 
   const {
     systems,
@@ -252,7 +255,7 @@ function Dashboard() {
         style={{
           display: "grid",
           gridTemplateColumns:
-            "repeat(4, minmax(0, 1fr))",
+            "repeat(auto-fit, minmax(170px, 1fr))",
           gap: "16px",
           marginBottom: "32px",
         }}
@@ -321,7 +324,7 @@ function Dashboard() {
           style={{
             display: "grid",
             gridTemplateColumns:
-              "repeat(3, minmax(0, 1fr))",
+              "repeat(auto-fit, minmax(170px, 1fr))",
             gap: "16px",
           }}
         >
@@ -431,6 +434,7 @@ function Dashboard() {
                 return (
                   <div
                     key={system.id}
+                    className="dashboard-system-row"
                     style={{
                       display: "grid",
                       gridTemplateColumns:
@@ -647,6 +651,7 @@ function Dashboard() {
                         title={`Delete ${system.name}`}
                         aria-label={`Delete ${system.name}`}
                         disabled={
+                          !canEdit ||
                           deletingSystemId ===
                           system.id
                         }

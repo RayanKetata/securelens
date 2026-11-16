@@ -43,8 +43,9 @@ export default function AIAssessmentPanel({ systemId, control, disabled, onApply
         </button>
       </div>
       <p>Send extracted evidence to OpenAI for a suggested assessment of this control description. You make the final decision.</p>
-      {!ready && <p>Upload a PDF or TXT file with successfully extracted text to begin.</p>}
-      {skipped.length > 0 && <p role="status">Excluded because text is unavailable: {skipped.map(item => item.name).join(", ")}. Image-only PDFs need a text version.</p>}
+      {!ready && <p>Upload a PDF, TXT, PNG, or JPEG file with successfully extracted text to begin.</p>}
+      {skipped.length > 0 && <p role="status">Excluded because text is unavailable: {skipped.map(item => item.name).join(", ")}. Scanned PDFs and images need OCR on the server (see Settings).</p>}
+      {control.evidence?.some(item => item.extractionStatus === "completed" && item.extractionMethod?.includes("ocr")) && <p role="note">Some evidence text was read with OCR. The AI is told it may contain recognition errors.</p>}
       {analyzing && <p role="status">Reviewing the available evidence. This may take up to a minute.</p>}
       {error && <p role="alert" className="assessment-message">{error}</p>}
       {result && <div className="ai-result" aria-live="polite">

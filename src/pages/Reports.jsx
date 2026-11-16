@@ -3,6 +3,8 @@ import { useNavigate } from "react-router";
 import { useSystems } from "../context/systems-context";
 import InfoTooltip from "../components/InfoTooltip";
 import {exportSystemReport} from "../utils/exportReportPdf";
+import { downloadAssessmentCsv } from "../utils/exportCsv";
+import { buildRiskSummary } from "../utils/riskSummary";
 
 function Reports() {
   const navigate = useNavigate();
@@ -31,6 +33,7 @@ function Reports() {
 
       return {
         ...system,
+        headline: buildRiskSummary(system).headline,
         totalControls,
         met,
         partiallyMet,
@@ -74,6 +77,15 @@ function Reports() {
             Review security assessment reports across all systems.
           </p>
         </div>
+
+        <button
+          type="button"
+          className="secondary-button"
+          disabled={systems.length === 0}
+          onClick={() => downloadAssessmentCsv(systems)}
+        >
+          Export All (CSV)
+        </button>
       </div>
 
       <div className="reports-summary-grid">
@@ -141,6 +153,10 @@ function Reports() {
                   {report.risk}
                 </span>
               </div>
+
+              <p className="report-card-headline">
+                {report.headline}
+              </p>
 
               <div className="report-progress-section">
                 <div className="report-progress-header">

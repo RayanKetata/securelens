@@ -1,13 +1,24 @@
 import { useState } from "react";
 import { useNavigate } from "react-router";
 import { useSystems } from "../context/systems-context";
+import { useAuth } from "../context/auth-context";
 
 function Systems() {
-  const { systems, addSystem } = useSystems();
+  const {
+    systems,
+    loadingSystems,
+    addSystem,
+  } = useSystems();
 
   const navigate = useNavigate();
 
+  const { canEdit } = useAuth();
+
   const [showForm, setShowForm] = useState(false);
+
+  const [creating, setCreating] = useState(false);
+
+  const [formError, setFormError] = useState("");
 
   const [formData, setFormData] = useState({
     name: "",
@@ -25,10 +36,23 @@ function Systems() {
     });
   }
 
-  function handleSubmit(event) {
+  async function handleSubmit(event) {
     event.preventDefault();
 
-    addSystem(formData);
+    setCreating(true);
+    setFormError("");
+
+    const created = await addSystem(formData);
+
+    setCreating(false);
+
+    if (!created) {
+      setFormError(
+        "The system could not be created. Check the details and try again."
+      );
+
+      return;
+    }
 
     setFormData({
       name: "",
@@ -54,6 +78,8 @@ function Systems() {
 
         <button
           className="primary-button"
+          disabled={!canEdit}
+          title={canEdit ? undefined : "Viewers cannot add systems"}
           onClick={() => setShowForm(true)}
         >
           + Add System
@@ -131,6 +157,22 @@ function Systems() {
             </thead>
 
             <tbody>
+              {loadingSystems && (
+                <tr>
+                  <td colSpan={7}>Loading systems...</td>
+                </tr>
+              )}
+
+              {!loadingSystems && systems.length === 0 && (
+                <tr>
+                  <td colSpan={7}>
+                    No systems yet. Select{" "}
+                    <strong>+ Add System</strong> to
+                    register your first system.
+                  </td>
+                </tr>
+              )}
+
               {systems.map((system) => (
                 <tr key={system.id}>
                   <td className="system-name">
@@ -221,6 +263,15 @@ function Systems() {
             </div>
 
             <form onSubmit={handleSubmit}>
+              {formError && (
+                <div
+                  className="assessment-message"
+                  role="alert"
+                >
+                  {formError}
+                </div>
+              )}
+
               <div className="form-group">
                 <label>System Name</label>
 
@@ -297,8 +348,11 @@ function Systems() {
                 <button
                   type="submit"
                   className="primary-button"
+                  disabled={creating}
                 >
-                  Create System
+                  {creating
+                    ? "Creating..."
+                    : "Create System"}
                 </button>
               </div>
             </form>

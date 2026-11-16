@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useNavigate, useParams } from "react-router";
 
 import { useSystems } from "../context/systems-context";
+import { useAuth } from "../context/auth-context";
 import InfoTooltip from "../components/InfoTooltip";
 import controlCatalog from "../data/controlCatalog";
 
@@ -11,21 +12,15 @@ function SystemDetails() {
 
   const {
     systems,
+    loadingSystems,
     addControlsToSystem,
     removeControlFromSystem,
+    editSystem,
+    removeSystem,
   } = useSystems();
-    
-  function handleDeleteControl(control) {
-    const confirmed = window.confirm(
-    `Remove ${control.code} — ${control.name} from this system?\n\nAny assessment information saved for this control will also be removed.`
-        );
 
-        if (!confirmed) {
-         return;
-     }
+  const { canEdit } = useAuth();
 
-  removeControlFromSystem(system.id, control.code);
-}
   const [showControlModal, setShowControlModal] =
     useState(false);
 
@@ -34,10 +29,24 @@ function SystemDetails() {
 
   const [searchTerm, setSearchTerm] = useState("");
 
+  const [message, setMessage] = useState("");
+
+  const [editForm, setEditForm] = useState(null);
+
+  const [busy, setBusy] = useState(false);
+
   const system = systems.find(
     (currentSystem) =>
       currentSystem.id.toString() === id
   );
+
+  if (loadingSystems) {
+    return (
+      <div className="system-details-page">
+        <h1>Loading system...</h1>
+      </div>
+    );
+  }
 
   if (!system) {
     return (
@@ -105,17 +114,136 @@ function SystemDetails() {
     });
   }
 
-  function handleAddControls() {
+  function controlPath(control) {
+    return `/systems/${system.id}/controls/${encodeURIComponent(control.code)}`;
+  }
+
+  async function handleDeleteControl(control) {
+    const confirmed = window.confirm(
+      `Remove ${control.code} — ${control.name} from this system?\n\nAny assessment information and evidence saved for this control will also be removed.`
+    );
+
+    if (!confirmed) {
+      return;
+    }
+
+    setMessage("");
+
+    const success = await removeControlFromSystem(
+      system.id,
+      control.code
+    );
+
+    if (!success) {
+      setMessage(`${control.code} could not be removed.`);
+    }
+  }
+
+  async function handleAddControls() {
     const controls = controlCatalog.filter(
       (control) =>
         selectedControls.includes(control.code)
     );
 
-    addControlsToSystem(id, controls);
+    setBusy(true);
+    setMessage("");
+
+    const created = await addControlsToSystem(
+      system.id,
+      controls
+    );
+
+    setBusy(false);
+
+    if (!created) {
+      setMessage("The selected controls could not be added.");
+      return;
+    }
 
     setSelectedControls([]);
     setSearchTerm("");
     setShowControlModal(false);
+  }
+
+  /*
+   * Start Assessment: open the first control that still
+   * needs review, or prompt to add controls when none exist.
+   */
+  function handleStartAssessment() {
+    if (system.controls.length === 0) {
+      setShowControlModal(true);
+      return;
+    }
+
+    const nextControl =
+      system.controls.find(
+        (control) =>
+          control.status === "Not Assessed"
+      ) || system.controls[0];
+
+    navigate(controlPath(nextControl));
+  }
+
+  function openEditForm() {
+    setEditForm({
+      name: system.name,
+      owner: system.owner,
+      environment: system.environment,
+      description: system.description || "",
+    });
+  }
+
+  function handleEditChange(event) {
+    const { name, value } = event.target;
+
+    setEditForm((current) => ({
+      ...current,
+      [name]: value,
+    }));
+  }
+
+  async function handleEditSubmit(event) {
+    event.preventDefault();
+
+    setBusy(true);
+    setMessage("");
+
+    const updated = await editSystem(
+      system.id,
+      editForm
+    );
+
+    setBusy(false);
+
+    if (!updated) {
+      setMessage("The system details could not be saved.");
+      return;
+    }
+
+    setEditForm(null);
+    setMessage("System details updated.");
+  }
+
+  async function handleDeleteSystem() {
+    const confirmed = window.confirm(
+      `Delete "${system.name}"?\n\nThis permanently deletes the system, its controls, assessments, and evidence.`
+    );
+
+    if (!confirmed) {
+      return;
+    }
+
+    setBusy(true);
+
+    const success = await removeSystem(system.id);
+
+    setBusy(false);
+
+    if (success) {
+      navigate("/systems");
+    } else {
+      setMessage("The system could not be deleted.");
+    }
   }
 
   function closeControlModal() {
@@ -162,10 +290,47 @@ function SystemDetails() {
           <p>{system.description}</p>
         </div>
 
-        <button className="primary-button">
-          Start Assessment
-        </button>
+        <div className="control-modal-actions">
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={openEditForm}
+            disabled={busy || !canEdit}
+          >
+            Edit Details
+          </button>
+
+          <button
+            type="button"
+            className="danger-button"
+            onClick={handleDeleteSystem}
+            disabled={busy || !canEdit}
+          >
+            Delete System
+          </button>
+
+          <button
+            type="button"
+            className="primary-button"
+            onClick={handleStartAssessment}
+          >
+            {system.controls.length === 0
+              ? "Start Assessment"
+              : system.status === "Completed"
+                ? "Review Assessment"
+                : "Continue Assessment"}
+          </button>
+        </div>
       </div>
+
+      {message && (
+        <div
+          className="assessment-message"
+          role="status"
+        >
+          {message}
+        </div>
+      )}
 
       <div className="system-information-grid">
         <div className="system-info-card">
@@ -339,6 +504,7 @@ function SystemDetails() {
 
           <button
             className="primary-button"
+            disabled={!canEdit}
             onClick={() =>
               setShowControlModal(true)
             }
@@ -358,6 +524,7 @@ function SystemDetails() {
 
             <button
               className="primary-button empty-state-button"
+              disabled={!canEdit}
               onClick={() =>
                 setShowControlModal(true)
               }
@@ -420,9 +587,7 @@ function SystemDetails() {
                             <button
                                 className="view-button"
                                 onClick={() =>
-                                    navigate(
-                                        `/systems/${system.id}/controls/${control.code}`
-                                    )   
+                                    navigate(controlPath(control))
                                 }
                                 >
                                 Assess
@@ -430,6 +595,7 @@ function SystemDetails() {
 
                             <button
                                 className="delete-control-button"
+                                disabled={!canEdit}
                                 onClick={() => handleDeleteControl(control)}
                                 title={`Remove ${control.code}`}
                                 aria-label={`Remove ${control.code}`}
@@ -567,7 +733,9 @@ function SystemDetails() {
                 <button
                   className="primary-button"
                   disabled={
-                    selectedControls.length === 0
+                    selectedControls.length === 0 ||
+                    busy ||
+                    !canEdit
                   }
                   onClick={handleAddControls}
                 >
@@ -582,6 +750,127 @@ function SystemDetails() {
                 </button>
               </div>
             </div>
+          </div>
+        </div>
+      )}
+
+      {editForm && (
+        <div className="modal-overlay">
+          <div className="modal">
+            <div className="modal-header">
+              <div>
+                <h2>Edit System</h2>
+
+                <p>
+                  Update the details for this system.
+                </p>
+              </div>
+
+              <button
+                type="button"
+                className="close-button"
+                aria-label="Close"
+                onClick={() => setEditForm(null)}
+              >
+                ×
+              </button>
+            </div>
+
+            <form onSubmit={handleEditSubmit}>
+              <div className="form-group">
+                <label htmlFor="edit-system-name">
+                  System Name
+                </label>
+
+                <input
+                  id="edit-system-name"
+                  type="text"
+                  name="name"
+                  value={editForm.name}
+                  onChange={handleEditChange}
+                  maxLength={200}
+                  required
+                />
+              </div>
+
+              <div className="form-group">
+                <label htmlFor="edit-system-owner">
+                  Business Owner
+                </label>
+
+                <input
+                  id="edit-system-owner"
+                  type="text"
+                  name="owner"
+                  value={editForm.owner}
+                  onChange={handleEditChange}
+                  maxLength={200}
+                  required
+                />
+              </div>
+
+              <div className="form-group">
+                <label htmlFor="edit-system-environment">
+                  Environment
+                </label>
+
+                <select
+                  id="edit-system-environment"
+                  name="environment"
+                  value={editForm.environment}
+                  onChange={handleEditChange}
+                >
+                  {[
+                    "Development",
+                    "Testing",
+                    "Staging",
+                    "Production",
+                    editForm.environment,
+                  ]
+                    .filter(
+                      (value, index, all) =>
+                        all.indexOf(value) === index
+                    )
+                    .map((value) => (
+                      <option key={value} value={value}>
+                        {value}
+                      </option>
+                    ))}
+                </select>
+              </div>
+
+              <div className="form-group">
+                <label htmlFor="edit-system-description">
+                  Description
+                </label>
+
+                <textarea
+                  id="edit-system-description"
+                  name="description"
+                  value={editForm.description}
+                  onChange={handleEditChange}
+                  rows="4"
+                ></textarea>
+              </div>
+
+              <div className="modal-actions">
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => setEditForm(null)}
+                >
+                  Cancel
+                </button>
+
+                <button
+                  type="submit"
+                  className="primary-button"
+                  disabled={busy}
+                >
+                  {busy ? "Saving..." : "Save Changes"}
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

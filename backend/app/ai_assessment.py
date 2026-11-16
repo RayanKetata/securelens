@@ -46,10 +46,18 @@ def build_evidence_text(
             )
         text_to_use = text
 
+        method = getattr(evidence, "extraction_method", None) or ""
+        source = (
+            "Text source: OCR of scanned pages; may contain "
+            "recognition errors.\n"
+            if "ocr" in method
+            else ""
+        )
+
         section = f"""
 --- EVIDENCE FILE ---
 Filename: {evidence.original_filename}
-
+{source}
 {text_to_use}
 
 --- END EVIDENCE FILE ---

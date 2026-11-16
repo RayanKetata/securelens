@@ -1,19 +1,29 @@
 import { useNavigate, useParams } from "react-router";
 import { exportSystemReport } from "../utils/exportReportPdf";
+import { downloadAssessmentCsv } from "../utils/exportCsv";
 import { useSystems } from "../context/systems-context";
 import InfoTooltip from "../components/InfoTooltip";
+import RiskSummary from "../components/RiskSummary";
 
 function ReportDetails() {
   const { id } = useParams();
 
   const navigate = useNavigate();
 
-  const { systems } = useSystems();
+  const { systems, loadingSystems } = useSystems();
 
   const system = systems.find(
     (currentSystem) =>
       currentSystem.id.toString() === id
   );
+
+  if (loadingSystems) {
+    return (
+      <div className="report-details-page">
+        <h1>Loading report...</h1>
+      </div>
+    );
+  }
 
   if (!system) {
     return (
@@ -74,14 +84,30 @@ function ReportDetails() {
           </p>
         </div>
 
-        <button
-          className="primary-button"
-          onClick={() => 
-            exportSystemReport(system)
+        <div className="control-modal-actions">
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={() =>
+              downloadAssessmentCsv(
+                [system],
+                system.name
+              )
             }
-         >
-          Export PDF
-        </button>
+          >
+            Export CSV
+          </button>
+
+          <button
+            type="button"
+            className="primary-button"
+            onClick={() =>
+              exportSystemReport(system)
+            }
+          >
+            Export PDF
+          </button>
+        </div>
       </div>
 
       <div className="report-system-info">
@@ -173,6 +199,8 @@ function ReportDetails() {
           </p>
         </div>
       </div>
+
+      <RiskSummary system={system} />
 
       <div className="panel report-controls-panel">
         <div className="report-section-heading">

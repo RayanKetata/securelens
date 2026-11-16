@@ -1,10 +1,12 @@
 import { useState } from "react";
 import { useNavigate, useParams } from "react-router";
 
-import { getEvidenceText } from "../services/api";
+import { getEvidenceText, openEvidenceFile, reextractEvidence } from "../services/api";
+import { useAuth } from "../context/auth-context";
 import { useSystems } from "../context/systems-context";
 import InfoTooltip from "../components/InfoTooltip";
 import AIAssessmentPanel from "../components/AIAssessmentPanel";
+import AssessmentHistory from "../components/AssessmentHistory";
 
 
 function ControlAssessment() {
@@ -127,7 +129,8 @@ function ControlAssessment() {
 
 function AssessmentForm({ system, control }) {
   const navigate = useNavigate();
-  const { updateControlAssessment, addEvidenceToControl, removeEvidenceFromControl } = useSystems();
+  const { updateControlAssessment, addEvidenceToControl, removeEvidenceFromControl, refreshSystem } = useSystems();
+  const { canEdit } = useAuth();
   // -------------------------------------------------------
   // LOCAL FORM STATE
   // -------------------------------------------------------
@@ -177,6 +180,49 @@ function AssessmentForm({ system, control }) {
     setEvidenceTextError,
   ] = useState("");
 
+  const [
+    historyVersion,
+    setHistoryVersion,
+  ] = useState(0);
+
+  const [
+    reextractingId,
+    setReextractingId,
+  ] = useState(null);
+
+
+  // -------------------------------------------------------
+  // RE-RUN TEXT EXTRACTION (e.g. after OCR was installed)
+  // -------------------------------------------------------
+
+  async function handleReextract(evidence) {
+    if (!system || reextractingId) {
+      return;
+    }
+
+    try {
+      setReextractingId(evidence.id);
+      setMessage("");
+
+      const updated = await reextractEvidence(evidence.id);
+      await refreshSystem(system.id);
+
+      if (selectedEvidenceText?.id === evidence.id) {
+        setSelectedEvidenceText(await getEvidenceText(evidence.id));
+      }
+
+      setMessage(
+        updated.extractionStatus === "completed"
+          ? `Text was extracted from ${evidence.name}.`
+          : `Still no text in ${evidence.name}.${updated.extractionNote ? ` ${updated.extractionNote}.` : ""}`
+      );
+    } catch (error) {
+      setMessage(error.message || "Text extraction could not be run again.");
+    } finally {
+      setReextractingId(null);
+    }
+  }
+
 
   // -------------------------------------------------------
   // SAVE ASSESSMENT
@@ -214,6 +260,10 @@ function AssessmentForm({ system, control }) {
 
       setMessage(
         "Assessment saved successfully."
+      );
+
+      setHistoryVersion(
+        (current) => current + 1
       );
 
       if (returnToSystem) {
@@ -267,11 +317,10 @@ function AssessmentForm({ system, control }) {
             ?.toLowerCase();
 
         if (
-          extension !== "pdf" &&
-          extension !== "txt"
+          !["pdf", "txt", "png", "jpg", "jpeg"].includes(extension)
         ) {
           setMessage(
-            `${file.name} was skipped. Only PDF and TXT files are allowed.`
+            `${file.name} was skipped. Only PDF, TXT, PNG, and JPEG files are allowed.`
           );
 
           continue;
@@ -314,23 +363,12 @@ function AssessmentForm({ system, control }) {
   function handleViewEvidence(
     evidence
   ) {
-    if (!evidence?.downloadUrl) {
-      console.error(
-        "No download URL found for this evidence."
-      );
-
+    openEvidenceFile(evidence.id).catch((error) => {
       setMessage(
-        "This evidence file cannot be opened."
+        error.message ||
+          "This evidence file cannot be opened."
       );
-
-      return;
-    }
-
-    window.open(
-      evidence.downloadUrl,
-      "_blank",
-      "noopener,noreferrer"
-    );
+    });
   }
 
 
@@ -531,6 +569,12 @@ function AssessmentForm({ system, control }) {
       </div>
 
 
+      {!canEdit && (
+        <div className="assessment-message" role="status">
+          You have view-only access. Ask an admin for the analyst role to change assessments or evidence.
+        </div>
+      )}
+
       {/* MESSAGE */}
 
       {message && (
@@ -601,7 +645,7 @@ function AssessmentForm({ system, control }) {
             key={JSON.stringify(control.evidence?.map(item => [item.id, item.extractionStatus]))}
             systemId={system.id}
             control={control}
-            disabled={uploading || saving}
+            disabled={uploading || saving || !canEdit}
             onApply={(result) => {
               setAssessmentStatus(result.suggestedStatus);
               setMessage("AI status applied to your draft. Review it and save the assessment to confirm.");
@@ -626,6 +670,7 @@ function AssessmentForm({ system, control }) {
 
               <button
                 type="button"
+                disabled={!canEdit}
                 className={`assessment-option ${
                   assessmentStatus === "Met"
                     ? "selected"
@@ -650,6 +695,7 @@ function AssessmentForm({ system, control }) {
 
               <button
                 type="button"
+                disabled={!canEdit}
                 className={`assessment-option ${
                   assessmentStatus ===
                   "Partially Met"
@@ -676,6 +722,7 @@ function AssessmentForm({ system, control }) {
 
               <button
                 type="button"
+                disabled={!canEdit}
                 className={`assessment-option ${
                   assessmentStatus ===
                   "Not Met"
@@ -726,6 +773,7 @@ function AssessmentForm({ system, control }) {
             </div>
 
             <textarea
+              readOnly={!canEdit}
               value={analystNotes}
               onChange={(event) =>
                 setAnalystNotes(
@@ -752,6 +800,7 @@ function AssessmentForm({ system, control }) {
             </div>
 
             <textarea
+              readOnly={!canEdit}
               value={findings}
               onChange={(event) =>
                 setFindings(
@@ -775,9 +824,9 @@ function AssessmentForm({ system, control }) {
                 </h2>
 
                 <p>
-                  Upload PDF or TXT files
-                  that support this
-                  assessment.
+                  Upload documents or
+                  screenshots that support
+                  this assessment.
                 </p>
               </div>
 
@@ -798,9 +847,9 @@ function AssessmentForm({ system, control }) {
 
                 <input
                   type="file"
-                  accept=".pdf,.txt,application/pdf,text/plain"
+                  accept=".pdf,.txt,.png,.jpg,.jpeg,application/pdf,text/plain,image/png,image/jpeg"
                   multiple
-                  disabled={uploading}
+                  disabled={uploading || !canEdit}
                   onChange={
                     handleEvidenceUpload
                   }
@@ -811,8 +860,10 @@ function AssessmentForm({ system, control }) {
               </label>
 
               <p>
-                PDF and TXT files only.
-                Maximum 10 MB per file.
+                PDF, TXT, PNG, and JPEG
+                files. Maximum 10 MB per
+                file. Text in scanned pages
+                and images is read with OCR.
               </p>
             </div>
 
@@ -858,6 +909,17 @@ function AssessmentForm({ system, control }) {
                                 evidence.extractionStatus
                               }
                             </strong>
+                            {evidence.extractionMethod?.includes("ocr") && (
+                              <span className="ocr-badge" title="Text was read from scanned pages with OCR and may contain errors.">
+                                OCR
+                              </span>
+                            )}
+                          </span>
+                        )}
+
+                        {evidence.extractionNote && (
+                          <span className="evidence-note">
+                            {evidence.extractionNote}.
                           </span>
                         )}
 
@@ -892,9 +954,22 @@ function AssessmentForm({ system, control }) {
                         </button>
 
 
+                        {canEdit && (evidence.extractionStatus !== "completed" || evidence.extractionNote) && (
+                          <button
+                            type="button"
+                            className="secondary-button"
+                            disabled={reextractingId !== null}
+                            onClick={() => handleReextract(evidence)}
+                          >
+                            {reextractingId === evidence.id ? "Extracting…" : "Try Text Extraction Again"}
+                          </button>
+                        )}
+
+
                         <button
                           type="button"
                           className="danger-button"
+                          disabled={!canEdit}
                           onClick={() =>
                             handleDeleteEvidence(
                               evidence
@@ -1021,6 +1096,21 @@ function AssessmentForm({ system, control }) {
                   </strong>
                 </p>
 
+                {selectedEvidenceText.extractionMethod?.includes("ocr") && (
+                  <p className="ocr-caveat" role="note">
+                    {selectedEvidenceText.extractionMethod === "ocr"
+                      ? "This text was read from scanned pages with OCR."
+                      : "Part of this text was read from scanned pages with OCR."}{" "}
+                    It may contain recognition errors, so check important details against the original file.
+                  </p>
+                )}
+
+                {selectedEvidenceText.extractionNote && (
+                  <p className="evidence-note">
+                    {selectedEvidenceText.extractionNote}.
+                  </p>
+                )}
+
 
                 {selectedEvidenceText.extractedText ? (
 
@@ -1069,10 +1159,11 @@ function AssessmentForm({ system, control }) {
                     {selectedEvidenceText.extractionStatus ===
                       "empty" && (
                       <p>
-                        This may be a
-                        scanned PDF or an
-                        image-only
-                        document.
+                        Scanned PDFs and images
+                        need OCR (Tesseract) on
+                        the server. Settings shows
+                        whether OCR is
+                        available.
                       </p>
                     )}
 
@@ -1101,7 +1192,7 @@ function AssessmentForm({ system, control }) {
             <button
               type="button"
               className="secondary-button"
-              disabled={saving}
+              disabled={saving || !canEdit}
               onClick={() =>
                 handleSaveAssessment(
                   false
@@ -1117,7 +1208,7 @@ function AssessmentForm({ system, control }) {
             <button
               type="button"
               className="primary-button"
-              disabled={saving}
+              disabled={saving || !canEdit}
               onClick={() =>
                 handleSaveAssessment(
                   true
@@ -1232,6 +1323,13 @@ function AssessmentForm({ system, control }) {
             </div>
 
           </div>
+
+
+          <AssessmentHistory
+            systemId={system.id}
+            controlCode={control.code}
+            version={historyVersion}
+          />
 
         </aside>
 

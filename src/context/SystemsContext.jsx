@@ -7,6 +7,7 @@ import {
   getSystems,
   getSystem as getSystemApi,
   createSystem as createSystemApi,
+  updateSystem as updateSystemApi,
   deleteSystem as deleteSystemApi,
   addControls as addControlsApi,
   updateControlAssessment as updateControlAssessmentApi,
@@ -217,6 +218,53 @@ export function SystemsProvider({ children }) {
     } catch (error) {
       console.error(
         "Failed to create system:",
+        error
+      );
+
+      setSystemsError(
+        error.message
+      );
+
+      return null;
+    }
+  }
+
+
+  // -------------------------------------------------------
+  // UPDATE SYSTEM DETAILS
+  // -------------------------------------------------------
+
+  async function editSystem(
+    systemId,
+    changes
+  ) {
+    try {
+      setSystemsError(null);
+
+      const updatedSystem =
+        await updateSystemApi(
+          systemId,
+          changes
+        );
+
+      const preparedSystem =
+        prepareSystem(updatedSystem);
+
+      setSystems(
+        (currentSystems) =>
+          currentSystems.map(
+            (system) =>
+              String(system.id) ===
+              String(systemId)
+                ? preparedSystem
+                : system
+          )
+      );
+
+      return preparedSystem;
+    } catch (error) {
+      console.error(
+        "Failed to update system:",
         error
       );
 
@@ -489,6 +537,7 @@ export function SystemsProvider({ children }) {
         refreshSystem,
 
         addSystem,
+        editSystem,
         removeSystem,
 
         addControlsToSystem,
