@@ -176,7 +176,7 @@ npm test
 npm run build
 ```
 
-`npm test` runs the frontend unit tests with Node's built-in test runner (`node --test src/utils/`), so it needs no extra packages and can also be run directly when npm is broken.
+`npm test` runs the frontend unit tests with Node's built-in test runner (`node --test "src/**/*.test.js"`), so it needs no extra packages and can also be run directly when npm is broken. Keep the quotes, so Node expands the pattern the same way on every OS. A bare folder such as `src/utils/` works on Node 26 but fails on Node 24, which CI uses.
 
 If the Windows npm launcher reports a missing `npm-cli.js` (as it did on the development machine), the installed tools can also be run directly with `node node_modules/eslint/bin/eslint.js .`, `node node_modules/vite/bin/vite.js build`, and `node node_modules/vite/bin/vite.js` for development. Repair the npm installation before installing new dependencies.
 
