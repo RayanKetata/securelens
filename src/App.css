@@ -4675,3 +4675,47 @@ tbody tr:last-child td {
   background: #854d0e;
   color: #fef9c3;
 }
+
+/* Two-step verification */
+
+.mfa-settings {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid #e5e7eb;
+}
+
+.mfa-qr {
+  display: block;
+  margin: 8px 0 12px;
+  padding: 8px;
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+}
+
+.mfa-secret {
+  display: block;
+  margin-top: 6px;
+  font-size: 0.95rem;
+  letter-spacing: 0.04em;
+  word-break: break-all;
+}
+
+.mfa-codes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 16px;
+  margin: 12px 0 16px;
+  padding: 0;
+  list-style: none;
+  font-size: 1rem;
+}
+
+.dark-theme .mfa-settings {
+  border-color: #303449;
+}
+
+.auth-back-button {
+  width: 100%;
+  margin-top: 10px;
+}

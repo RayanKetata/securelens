@@ -38,6 +38,8 @@ services:
       # so cross-origin requests are not needed.
       CORS_ORIGINS: ""
       AUTO_MIGRATE: "true"
+      # Days to keep activity log entries; 0 keeps them forever.
+      ACTIVITY_RETENTION_DAYS: ${ACTIVITY_RETENTION_DAYS:-0}
     volumes:
       - uploads:/app/uploads
     # No published port: only the web container talks to the API.

@@ -13,6 +13,9 @@ export default function Login({ setup = false }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
+  // Shown after a correct password when the account has MFA on.
+  const [needsCode, setNeedsCode] = useState(false);
+  const [code, setCode] = useState("");
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -31,10 +34,17 @@ export default function Login({ setup = false }) {
       if (setup) {
         await completeSetup(username, password);
       } else {
-        await signIn(username, password);
+        await signIn(username, password, needsCode ? code : undefined);
       }
     } catch (failure) {
-      setError(failure.message || "Sign-in failed.");
+      if (failure.mfaRequired) {
+        // First time: just ask for the code. Afterwards: it was wrong.
+        if (needsCode) setError(failure.message);
+        setNeedsCode(true);
+        setCode("");
+      } else {
+        setError(failure.message || "Sign-in failed.");
+      }
       setSubmitting(false);
     }
   }
@@ -50,7 +60,11 @@ export default function Login({ setup = false }) {
           </div>
         </div>
 
-        <h2>{setup ? "Create the first admin account" : "Sign in"}</h2>
+        <h2>
+          {setup
+            ? "Create the first admin account"
+            : needsCode ? "Two-step verification" : "Sign in"}
+        </h2>
 
         {setup && (
           <p>
@@ -60,7 +74,7 @@ export default function Login({ setup = false }) {
           </p>
         )}
 
-        {!setup && notice && (
+        {!setup && !needsCode && notice && (
           <p className="assessment-message" role="status">
             {notice}
           </p>
@@ -72,6 +86,31 @@ export default function Login({ setup = false }) {
           </p>
         )}
 
+        {needsCode && (
+          <>
+            <p>
+              Enter the 6-digit code from your authenticator app for{" "}
+              <strong>{username}</strong>. If you lost your device, enter
+              one of your recovery codes instead.
+            </p>
+
+            <div className="form-group">
+              <label htmlFor="auth-code">Authentication code</label>
+              <input
+                id="auth-code"
+                type="text"
+                autoComplete="one-time-code"
+                value={code}
+                onChange={(event) => setCode(event.target.value)}
+                maxLength={32}
+                required
+                autoFocus
+              />
+            </div>
+          </>
+        )}
+
+        <div hidden={needsCode}>
         <div className="form-group">
           <label htmlFor="auth-username">Username</label>
           <input
@@ -118,11 +157,27 @@ export default function Login({ setup = false }) {
           </div>
         )}
 
+        </div>
+
         <button type="submit" className="primary-button" disabled={submitting}>
           {submitting
-            ? setup ? "Creating account..." : "Signing in..."
-            : setup ? "Create Admin Account" : "Sign In"}
+            ? setup ? "Creating account..." : needsCode ? "Verifying..." : "Signing in..."
+            : setup ? "Create Admin Account" : needsCode ? "Verify" : "Sign In"}
         </button>
+
+        {needsCode && (
+          <button
+            type="button"
+            className="secondary-button auth-back-button"
+            onClick={() => {
+              setNeedsCode(false);
+              setPassword("");
+              setError("");
+            }}
+          >
+            Back
+          </button>
+        )}
       </form>
     </div>
   );

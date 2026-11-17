@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     tesseract_cmd: str = "tesseract"
     ocr_languages: str = "eng"
 
+    # Delete activity log entries older than this many days. 0 keeps
+    # them forever. Export the log first if you must keep a copy.
+    activity_retention_days: int = 0
+
     openai_api_key: str | None = None
     openai_model: str = "gpt-5.6-luna"
 

@@ -15,7 +15,7 @@ os.environ["OPENAI_API_KEY"] = "offline-test-key"
 from fastapi.testclient import TestClient
 from openai import APITimeoutError, RateLimitError
 import httpx2
-from app import ai_assessment, auth, evidence_text, main, ocr, schemas
+from app import ai_assessment, auth, evidence_text, main, mfa, ocr, schemas
 from app.database import Base, engine
 
 
@@ -782,6 +782,174 @@ class WorkflowTests(unittest.TestCase):
             self.client.post("/auth/password", json={"currentPassword": "not-it-at-all", "newPassword": "new-password-456"})
         blocked = self.client.post("/auth/password", json={"currentPassword": TEST_PASSWORD, "newPassword": "new-password-456"})
         self.assertEqual(blocked.status_code, 429)
+
+    # ---------------- activity export and retention ----------------
+
+    def test_activity_export_is_csv_safe_and_admin_only(self):
+        self.client.put(self.system_url, json={"name": "=HYPERLINK(\"http://x\")", "owner": "IT", "environment": "Test"})
+        response = self.client.get("/activity/export")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.headers["content-type"].startswith("text/csv"))
+        self.assertIn("attachment; filename=\"securelens-activity-", response.headers["content-disposition"])
+        import csv
+        rows = list(csv.reader(io.StringIO(response.text)))
+        self.assertEqual(rows[0], ["id", "occurred_at_utc", "actor", "action", "summary", "client"])
+        self.assertEqual(rows[1][3], "auth.setup")  # oldest first
+        for row in rows[1:]:
+            for cell in row[2:]:
+                self.assertFalse(cell.startswith(("=", "+", "-", "@")), cell)
+        self.assertEqual(self.activity()[0]["action"], "activity.export")  # exporting is itself logged
+        only_auth = self.client.get("/activity/export", params={"category": "auth"}).text
+        self.assertNotIn("system.", only_auth)
+        self.assertEqual(self.client.get("/activity/export", params={"days": 0}).status_code, 422)
+        analyst = self.as_user("analyst5", "analyst")
+        self.assertEqual(self.client.get("/activity/export", headers=analyst).status_code, 403)
+
+    def test_activity_retention_removes_old_entries(self):
+        from datetime import datetime, timedelta, timezone
+        from app import models
+        from app.activity import purge_expired_activity
+        from app.database import SessionLocal
+        with SessionLocal() as db:
+            old = db.query(models.ActivityEvent).first()
+            old.occurred_at = datetime.now(timezone.utc) - timedelta(days=400)
+            db.commit()
+            total = db.query(models.ActivityEvent).count()
+            self.assertEqual(purge_expired_activity(db, 0), 0)  # 0 keeps everything
+            self.assertEqual(purge_expired_activity(db, 365), 1)
+            self.assertEqual(db.query(models.ActivityEvent).count(), total - 1)
+        with patch.object(main.settings, "activity_retention_days", 30):
+            self.assertEqual(self.client.get("/activity").status_code, 200)
+
+    # ---------------- multi-factor authentication ----------------
+
+    def turn_on_mfa(self, headers=None):
+        """Turn on MFA for the caller; returns (secret, recovery codes)."""
+        setup = self.client.post("/auth/mfa/setup", json={"currentPassword": TEST_PASSWORD}, headers=headers)
+        self.assertEqual(setup.status_code, 200, setup.text)
+        secret = setup.json()["secret"]
+        self.assertIn("otpauth://totp/SecureLens", setup.json()["otpauthUri"])
+        code = mfa.code_at(secret, mfa.current_step())
+        enabled = self.client.post("/auth/mfa/enable", json={"code": code}, headers=headers)
+        self.assertEqual(enabled.status_code, 200, enabled.text)
+        return secret, enabled.json()["recoveryCodes"]
+
+    def login_with_code(self, code, username="admin"):
+        return self.client.post("/auth/login", json={"username": username, "password": TEST_PASSWORD, "code": code})
+
+    def test_mfa_setup_and_sign_in(self):
+        self.assertFalse(self.client.get("/auth/me").json()["mfaEnabled"])
+        other = self.login("admin").json()["token"]
+        wrong_password = self.client.post("/auth/mfa/setup", json={"currentPassword": "not-it-at-all"})
+        self.assertEqual(wrong_password.status_code, 400)
+        self.assertEqual(self.client.post("/auth/mfa/enable", json={"code": "123456"}).status_code, 400)  # no setup yet
+        setup = self.client.post("/auth/mfa/setup", json={"currentPassword": TEST_PASSWORD}).json()
+        self.assertEqual(self.client.post("/auth/mfa/enable", json={"code": "000000"}).status_code, 400)
+        self.assertFalse(self.client.get("/auth/me").json()["mfaEnabled"])  # pending is not on
+        codes = self.client.post("/auth/mfa/enable",
+                                 json={"code": mfa.code_at(setup["secret"], mfa.current_step())}).json()["recoveryCodes"]
+        self.assertEqual(len(codes), mfa.RECOVERY_CODE_COUNT)
+        self.assertTrue(self.client.get("/auth/me").json()["mfaEnabled"])
+        self.assertEqual(self.client.get("/systems").status_code, 200)  # this session stays
+        self.assertEqual(self.client.get("/systems", headers={"Authorization": "Bearer " + other}).status_code, 401)
+        self.assertEqual(self.client.post("/auth/mfa/setup", json={"currentPassword": TEST_PASSWORD}).status_code, 409)
+
+        # A password alone now asks for the code, without counting as a failure.
+        for _ in range(auth.LoginThrottle.MAX_PER_ACCOUNT + 1):
+            asked = self.login("admin")
+            self.assertEqual(asked.status_code, 401)
+            self.assertTrue(asked.json()["mfaRequired"])
+            self.assertNotIn("token", asked.json())
+        # A wrong password never reveals that MFA is on.
+        self.assertNotIn("mfaRequired", self.login("admin", "wrong-password-123").json())
+        self.assertNotIn("token", self.login_with_code("000000").json())
+
+        # The next code works once; replaying it is refused.
+        next_code = mfa.code_at(setup["secret"], mfa.current_step() + 1)
+        self.assertEqual(self.login_with_code(next_code).status_code, 200)
+        replay = self.login_with_code(next_code)
+        self.assertEqual(replay.status_code, 401)
+        self.assertTrue(replay.json()["mfaRequired"])
+
+    def test_mfa_recovery_codes_are_single_use(self):
+        secret, codes = self.turn_on_mfa()
+        from app import models
+        from app.database import SessionLocal
+        with SessionLocal() as db:
+            user = db.query(models.User).filter_by(username="admin").one()
+            self.assertNotIn(codes[0], user.mfa_recovery_codes)  # only hashes stored
+            self.assertNotIn("secret", str(self.client.get("/auth/me").json()).lower())
+        self.assertEqual(self.login_with_code(codes[0].upper()).status_code, 200)
+        self.assertEqual(self.login_with_code(codes[0]).status_code, 401)
+        summaries = [event["summary"] for event in self.activity(category="auth")]
+        self.assertIn(f"Signed in with a recovery code ({mfa.RECOVERY_CODE_COUNT - 1} left)", summaries)
+        totp = mfa.code_at(secret, mfa.current_step() + 1)
+        renewed = self.client.post("/auth/mfa/recovery-codes", json={"currentPassword": TEST_PASSWORD, "code": totp})
+        self.assertEqual(renewed.status_code, 200, renewed.text)
+        self.assertEqual(self.login_with_code(codes[1]).status_code, 401)  # old codes stop working
+        self.assertEqual(self.login_with_code(renewed.json()["recoveryCodes"][0]).status_code, 200)
+
+    def test_mfa_can_be_turned_off(self):
+        secret, codes = self.turn_on_mfa()
+        no_code = self.client.post("/auth/mfa/disable", json={"currentPassword": TEST_PASSWORD, "code": "000000"})
+        self.assertEqual(no_code.status_code, 400)
+        no_password = self.client.post("/auth/mfa/disable", json={"currentPassword": "not-it-at-all", "code": codes[0]})
+        self.assertEqual(no_password.status_code, 400)
+        off = self.client.post("/auth/mfa/disable", json={"currentPassword": TEST_PASSWORD, "code": codes[0]})
+        self.assertEqual(off.status_code, 204, off.text)
+        self.assertEqual(self.login("admin").status_code, 200)
+        self.assertEqual(self.client.post("/auth/mfa/disable",
+                                          json={"currentPassword": TEST_PASSWORD, "code": "x"}).status_code, 409)
+        actions = [event["action"] for event in self.activity(category="auth")]
+        self.assertIn("auth.mfa_enable", actions)
+        self.assertIn("auth.mfa_disable", actions)
+
+    def test_admin_can_reset_a_lost_authenticator(self):
+        analyst = self.as_user("analyst4", "analyst")
+        self.turn_on_mfa(headers=analyst)
+        users = {row["username"]: row for row in self.client.get("/users").json()}
+        self.assertTrue(users["analyst4"]["mfaEnabled"])
+        self.assertEqual(self.client.put(f"/users/{users['analyst4']['id']}", json={"disableMfa": True},
+                                         headers=analyst).status_code, 403)
+        reset = self.client.put(f"/users/{users['analyst4']['id']}", json={"disableMfa": True})
+        self.assertEqual(reset.status_code, 200)
+        self.assertFalse(reset.json()["mfaEnabled"])
+        self.assertEqual(self.client.get("/systems", headers=analyst).status_code, 401)  # signed out
+        self.assertEqual(self.login("analyst4").status_code, 200)
+
+    def test_wrong_mfa_codes_are_throttled(self):
+        self.turn_on_mfa()
+        for _ in range(auth.LoginThrottle.MAX_PER_ACCOUNT):
+            self.assertEqual(self.login_with_code("000000").status_code, 401)
+        self.assertEqual(self.login_with_code("000000").status_code, 429)
+
+
+class TOTPUnitTests(unittest.TestCase):
+    # RFC 6238 appendix B, SHA-1 secret "12345678901234567890", last 6 digits.
+    SECRET = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+
+    def test_rfc_6238_vectors(self):
+        for timestamp, expected in [(59, "287082"), (1111111109, "081804"), (1111111111, "050471"),
+                                    (1234567890, "005924"), (2000000000, "279037"), (20000000000, "353130")]:
+            with self.subTest(timestamp=timestamp):
+                self.assertEqual(mfa.code_at(self.SECRET, mfa.current_step(timestamp)), expected)
+
+    def test_drift_window_and_replay(self):
+        now = 1111111111
+        step = mfa.current_step(now)
+        for offset in (-1, 0, 1):
+            self.assertEqual(mfa.verify_code(self.SECRET, mfa.code_at(self.SECRET, step + offset), now=now), step + offset)
+        self.assertIsNone(mfa.verify_code(self.SECRET, mfa.code_at(self.SECRET, step + 2), now=now))
+        self.assertIsNone(mfa.verify_code(self.SECRET, mfa.code_at(self.SECRET, step), last_step=step, now=now))
+        self.assertEqual(mfa.verify_code(self.SECRET, "050 471", now=now), step)  # spaces allowed
+        for bad in ("", "12345", "abcdef", "1234567"):
+            self.assertIsNone(mfa.verify_code(self.SECRET, bad, now=now))
+
+    def test_secrets_are_random_and_valid_base32(self):
+        first, second = mfa.new_secret(), mfa.new_secret()
+        self.assertNotEqual(first, second)
+        self.assertEqual(len(first), 32)
+        self.assertEqual(len(mfa.code_at(first, 1)), 6)
 
 
 if __name__ == "__main__":

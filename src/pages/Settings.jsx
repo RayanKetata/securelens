@@ -5,6 +5,7 @@ import { useSystems } from "../context/systems-context";
 import InfoTooltip from "../components/InfoTooltip";
 import UserManagement from "../components/UserManagement";
 import ChangePassword from "../components/ChangePassword";
+import TwoFactorSettings from "../components/TwoFactorSettings";
 import ActivityLog from "../components/ActivityLog";
 import { useAuth } from "../context/auth-context";
 
@@ -211,6 +212,8 @@ function Settings({ darkMode, onDarkModeChange }) {
             </p>
 
             <ChangePassword />
+
+            <TwoFactorSettings />
           </div>
 
           <div className="assessment-card">

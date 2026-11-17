@@ -81,8 +81,8 @@ export function AuthProvider({ children }) {
   }, []);
 
   const signIn = useCallback(
-    async (username, password) => {
-      finishSignIn(await loginApi(username, password));
+    async (username, password, code) => {
+      finishSignIn(await loginApi(username, password, code));
     },
     [finishSignIn]
   );
@@ -107,6 +107,11 @@ export function AuthProvider({ children }) {
     setStatus("signed-out");
   }, []);
 
+  // After turning MFA on or off, so the settings page shows it.
+  const refreshUser = useCallback(async () => {
+    setUser(await getCurrentUser());
+  }, []);
+
   const retry = useCallback(() => {
     setStatus("loading");
     setAttempt((current) => current + 1);
@@ -123,8 +128,9 @@ export function AuthProvider({ children }) {
       completeSetup,
       signOut,
       retry,
+      refreshUser,
     }),
-    [status, user, notice, signIn, completeSetup, signOut, retry]
+    [status, user, notice, signIn, completeSetup, signOut, retry, refreshUser]
   );
 
   return (

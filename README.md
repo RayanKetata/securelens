@@ -4,6 +4,18 @@
 
 The long-term goal is to make security-control assessment faster, more consistent, and easier to manage while keeping the **human security analyst in control of the final decision**.
 
+[![CI](https://github.com/RayanKetata/securelens/actions/workflows/ci.yml/badge.svg)](https://github.com/RayanKetata/securelens/actions/workflows/ci.yml)
+
+**Stack:** React 19 + Vite · FastAPI · PostgreSQL + Alembic · OpenAI Responses API (structured output) · Tesseract OCR · Docker Compose + nginx · GitHub Actions
+
+| Dashboard | Control assessment |
+| --- | --- |
+| ![Dashboard with systems, control counts, and compliance](docs/screenshots/dashboard.jpg) | ![RA-5 control assessment with AI review and status choices](docs/screenshots/control-assessment.jpg) |
+| **Report with rule-based risk summary** | **Two-step verification setup** |
+| ![Report for one system with risk summary and priority gaps](docs/screenshots/report.jpg) | ![Settings showing the authenticator QR code and key](docs/screenshots/two-step-setup.jpg) |
+
+Screenshots use the fictional demo data from `backend/seed_demo.py` (see [Demo data](#demo-data)).
+
 ---
 
 ## Status at a glance (2026-11-16)
@@ -13,10 +25,11 @@ The long-term goal is to make security-control assessment faster, more consisten
 - **Core app:** React frontend and FastAPI backend with PostgreSQL, covering systems, security controls, assessments, evidence, reports, dashboard, and settings. Input is validated, systems can be edited and deleted, and the layout works at phone width.
 - **Accounts and security:**
   - sign-in with admin, analyst, and viewer roles, and first-run admin setup
+  - **two-step verification** with authenticator apps (TOTP), single-use recovery codes, and an admin reset
   - user management by admins
   - self-service password change
   - a failed sign-in limit
-  - an admin activity log of who changed what
+  - an admin activity log of who changed what, with **CSV export** and an optional **retention period**
 - **Assessments:** saved history of every status, notes, or findings change, with who made it.
 - **Evidence:**
   - PDF, TXT, PNG, and JPEG uploads, with images checked by content
@@ -24,32 +37,32 @@ The long-term goal is to make security-control assessment faster, more consisten
   - re-running extraction on files already uploaded
   - **Search Inside Evidence** with highlighted excerpts
 - **AI review:** OpenAI suggests a status, reasoning, supporting facts, and gaps for a control. The analyst always makes and saves the decision. The AI is told when text came from OCR.
+- **AI accuracy benchmark:** 24 hand-labeled fictional cases over 6 controls (including prompt injection, contradictions, weaker thresholds, and OCR noise). `evaluate_ai.py` reports accuracy, per-status precision and recall, a confusion matrix, and how often a gap was wrongly called Met.
 - **Reports:** report pages with a rule-based risk summary, plus PDF and CSV export.
 - **Running and shipping:**
   - Alembic database migrations, applied automatically on startup
   - Docker Compose that runs PostgreSQL, the API, and nginx with one command
-  - GitHub Actions CI covering backend tests, frontend lint, tests, and build, and the Docker stack on PostgreSQL
+  - GitHub Actions CI covering backend tests, frontend lint, tests, and build, and the Docker stack on PostgreSQL, passing on GitHub
+  - a demo data script for showing the app
 
-**Tests:** 55 backend tests (2 of them need Tesseract and run in CI and Docker) and 12 frontend unit tests.
+**Tests:** 71 backend tests (2 of them need Tesseract and run in CI and Docker), 12 frontend unit tests, and 12 component tests (Vitest and Testing Library) for sign-in, two-step setup, and risk summaries.
 
 ### Still missing
 
 - **AI:**
   - RAG: chunking, embeddings, and retrieval of only the relevant evidence. Until then, AI analysis refuses evidence over 60,000 characters.
-  - A measured AI accuracy run, blocked by the OpenAI account's quota.
+  - A measured AI accuracy run: the benchmark and harness are ready, but the OpenAI account's quota blocks live requests.
   - A measure of OCR accuracy.
-- **Sign-in:** multi-factor authentication, single sign-on, and self-service "forgot password".
+- **Sign-in:** single sign-on, self-service "forgot password", and a setting to require two-step verification for everyone.
 - **Deployment:**
   - HTTPS
   - a hosting target and deployment pipeline (CD)
   - automated backups
   - a production database setup
-  - CI has not yet run on GitHub
-- **Testing:** component and page tests for the frontend. Only the logic in `src/utils` is unit-tested.
+- **Testing:** tests for the larger pages (control assessment, evidence, systems) and end-to-end browser tests.
 - **Smaller gaps:**
   - search does not find word variants or synonyms and has no full-text index
   - background processing for long OCR jobs
-  - activity log retention and export
   - the full NIST SP 800-53 control catalog (only 10 summarized controls)
 
 Details for each are in [Known gaps](#known-gaps-not-yet-implemented). The sections below cover setup, how each feature works, and what was verified. The design narrative further down describes the original plan and long-term ideas, not remaining tasks.
@@ -126,6 +139,7 @@ Every API route except `/`, `/health`, `/auth/status`, `/auth/setup`, and `/auth
 1. **First run:** with no accounts in the database, the app shows **Create the first admin account**. `POST /auth/setup` works only while the users table is empty; afterwards it returns `409`. Complete setup right after starting a fresh deployment, because until then anyone who can reach the app could claim the admin account.
 2. **Adding people:** admins add, re-role, reset, and delete accounts under **Settings → Users**.
 3. **Your own password:** every user can change their own password under **Settings → Your Account → Change Password**. It requires the current password, keeps the current browser signed in, and signs out every other session.
+4. **Two-step verification:** every user can turn it on under **Settings → Your Account**. See [Two-step verification](#two-step-verification).
 
 | Role | Can do |
 | --- | --- |
@@ -142,7 +156,26 @@ How it works:
 - **Evidence files** are fetched with the token and shown from a temporary blob URL, because a plain link cannot send the token.
 - **At least one admin** must always exist: the last admin cannot be demoted or deleted, and nobody can delete their own account.
 - **Assessment history** records the username of whoever saved each change.
-- **Activity log** (admins only, **Settings → Activity Log**, `GET /activity`): records who did what and when. It covers sign-ins, failed sign-ins, first-run setup, password changes, user account changes, system create/edit/delete, control add/remove and saved assessments, evidence upload/delete, and AI suggestions and failures. Each entry is saved in the same database transaction as the change itself, so a refused or failed action leaves no "done" entry. Sign-in entries also record the client address. Passwords are never logged. The app offers no way to edit or delete entries, and the list can be filtered by category and paged with **Load Older Entries**. Not logged: viewing or downloading evidence, sign-outs, and attempts refused by the failed sign-in limit. Entries are kept indefinitely; there is no retention or export yet.
+- **Activity log** (admins only, **Settings → Activity Log**, `GET /activity`): records who did what and when. It covers sign-ins, failed sign-ins, first-run setup, password changes, user account changes, system create/edit/delete, control add/remove and saved assessments, evidence upload/delete, and AI suggestions and failures. Each entry is saved in the same database transaction as the change itself, so a refused or failed action leaves no "done" entry. Sign-in entries also record the client address. Passwords are never logged. The app offers no way to edit or delete entries, and the list can be filtered by category and paged with **Load Older Entries**. Not logged: viewing or downloading evidence, sign-outs, and attempts refused by the failed sign-in limit. **Export CSV** (`GET /activity/export`, optional `days` and `category`) downloads the log oldest first; exporting is itself logged, and cells are protected against spreadsheet formulas. Entries are kept indefinitely unless `ACTIVITY_RETENTION_DAYS` is set, in which case older entries are deleted on startup and whenever the log is viewed or exported. Export first if you need an archive.
+
+### Two-step verification
+
+Users add SecureLens to an authenticator app (Google Authenticator, Microsoft Authenticator, 1Password, and similar) and then enter a 6-digit code after their password.
+
+1. **Turning it on:** **Settings → Your Account → Turn On Two-Step Verification** asks for the current password, shows a QR code and a text key, and asks for a first code to prove the app works (`POST /auth/mfa/setup`, then `POST /auth/mfa/enable`). It then shows 8 recovery codes once, with a **Download** button. Other sessions are signed out.
+2. **Signing in:** after a correct password the sign-in page asks for the code. `POST /auth/login` returns `401` with `"mfaRequired": true` until a valid `code` is sent with the username and password. A recovery code can be entered in the same box.
+3. **Turning it off or new recovery codes:** both need the current password and an app or recovery code (`POST /auth/mfa/disable`, `POST /auth/mfa/recovery-codes`).
+4. **Lost phone:** an admin can select **Turn Off Two-Step** for that user under **Settings → Users** (`PUT /users/{id}` with `"disableMfa": true`), which also signs them out. Confirm who they are first.
+
+How it works:
+
+- Codes follow RFC 6238 (TOTP: HMAC-SHA1, 6 digits, 30 seconds), implemented with the Python standard library and checked against the RFC's test vectors. One step of clock drift either side is accepted.
+- **No replay:** the last accepted time step is stored, so a code cannot be used twice.
+- **Recovery codes** are random, single use, and stored only as SHA-256 hashes.
+- **Throttling:** wrong codes count toward the same failed sign-in limit as wrong passwords. A correct password without a code is not counted as a failure, and a wrong password never reveals whether the account uses two-step verification.
+- Turning it on or off, using a recovery code, a wrong code, and an admin reset are all recorded in the activity log.
+- Migration `0004` adds the columns; existing accounts keep signing in with a password until each user turns it on.
+- **Limitation:** the authenticator secret is stored in the database unencrypted, so anyone who can read the `users` table can generate codes. Protect database access and backups accordingly.
 
 ### AI review workflow
 
@@ -176,7 +209,10 @@ npm test
 npm run build
 ```
 
-`npm test` runs the frontend unit tests with Node's built-in test runner (`node --test "src/**/*.test.js"`), so it needs no extra packages and can also be run directly when npm is broken. Keep the quotes, so Node expands the pattern the same way on every OS. A bare folder such as `src/utils/` works on Node 26 but fails on Node 24, which CI uses.
+`npm test` runs two suites:
+
+- **Logic tests** in `src/utils` (`*.test.js`) with Node's built-in test runner (`node --test "src/**/*.test.js"`). Keep the quotes, so Node expands the pattern the same way on every OS. A bare folder such as `src/utils/` works on Node 26 but fails on Node 24, which CI uses.
+- **Component tests** (`*.test.jsx`) with [Vitest](https://vitest.dev/) and React Testing Library in a jsdom browser environment (`npx vitest run`, or `npx vitest` to watch). They cover the sign-in page (including the two-step code step), the two-step settings panel with the API mocked, and the risk summary with its links. Configuration is in `vite.config.js`.
 
 If the Windows npm launcher reports a missing `npm-cli.js` (as it did on the development machine), the installed tools can also be run directly with `node node_modules/eslint/bin/eslint.js .`, `node node_modules/vite/bin/vite.js build`, and `node node_modules/vite/bin/vite.js` for development. Repair the npm installation before installing new dependencies.
 
@@ -184,13 +220,28 @@ From `backend`:
 
 ```powershell
 venv/Scripts/python.exe -m unittest discover -s tests -v
-# Opt-in: five small billable requests with fictional evidence only.
-venv/Scripts/python.exe evaluate_ai.py
+# Check the AI benchmark without calling the API.
+venv/Scripts/python.exe evaluate_ai.py --dry-run
+# Opt-in: one billable request per case (24) with fictional evidence only.
+venv/Scripts/python.exe evaluate_ai.py --out ai-results.json
 # Repeat to measure consistency across nondeterministic outputs.
 venv/Scripts/python.exe evaluate_ai.py --repeat 3
 ```
 
-The offline regression suite uses a temporary SQLite database and mocked provider calls; it never touches the configured PostgreSQL database or calls OpenAI. It covers upload/extraction, analyst-save separation, evidence limits, invalid files, and provider failures. The live evaluation fixture defines a narrow four-rule policy-documentation scope and tests complete, partial, irrelevant, prompt-injection, and explicitly unimplemented evidence. It exits 1 on status mismatches, 2 on a provider/configuration error, and 0 when all expected statuses match. Status matches alone do not verify every explanation or establish broad model accuracy.
+The offline regression suite uses a temporary SQLite database and mocked provider calls; it never touches the configured PostgreSQL database or calls OpenAI. It covers upload/extraction, analyst-save separation, evidence limits, invalid files, provider failures, two-step verification, activity export, and the evaluation harness's scoring.
+
+**AI accuracy benchmark** (`backend/tests/fixtures/ai_benchmark.json`): 24 fictional, hand-labeled cases over AC-2, IA-2, CP-9, RA-5, AU-2, and SI-2 (7 Met, 10 Partially Met, 7 Not Met). Each control lists explicit documented requirements, so the right answer is objective. The cases include complete and partial policies, irrelevant evidence, weaker thresholds (30 days instead of 24 hours), contradicting documents, a prompt injection alone and one hidden inside a real document, an outdated plan, and OCR-damaged text. `evaluate_ai.py` prints each result, then accuracy, per-status precision and recall, a confusion matrix, and **gaps wrongly called Met** (the costliest mistake for an assessor). `--out` saves everything as JSON. It stops early on quota or key errors and exits 2; otherwise it exits 0. A score measures agreement with these labels on documentation-only scopes; it does not establish accuracy on real, longer evidence.
+
+### Demo data
+
+To show the app to someone, fill an empty instance with fictional data (three systems, 13 controls, saved decisions, findings, and evidence):
+
+```powershell
+cd backend
+venv/Scripts/python.exe seed_demo.py --api http://127.0.0.1:8000 --password "<a password of 12+ characters>"
+```
+
+It creates the first admin (`admin`) if the instance is new, plus `analyst` and `viewer` accounts with the same password, so a reviewer can try each role. It refuses to run if systems already exist. For Docker, use `--api http://localhost:8080/api`. Use it only on a demo instance.
 
 For isolated browser testing, from `backend` run `venv/Scripts/python.exe -m tests.preview`. In another terminal at the project root:
 
@@ -286,6 +337,8 @@ Risk summaries (2026-11-15): all 30 backend tests, 7 new frontend unit tests (`n
 - The Reports cards showed the headline.
 - The generated PDF (captured in the page, not saved) contained the Risk Summary, Priority Gap table, Recommended Next Steps, the control details, and "Page N of 2" footers.
 
+Two-step verification, activity export, component tests, and the AI benchmark (2026-11-16): all 71 backend tests (2 real-OCR tests skipped locally), 12 frontend unit tests, 12 component tests, lint, and the build passed. The new backend tests cover the RFC 6238 test vectors, clock drift, code replay, setup with a wrong password or code, sign-in with and without a code, single-use and renewable recovery codes, turning it off, the admin reset, throttling of wrong codes, CSV export safety and permissions, retention, and the evaluation harness. Against a local PostgreSQL demo database filled by `seed_demo.py`, a browser check confirmed: turning on two-step verification (QR code, key, first code, recovery codes), being asked for a code after the password on the next sign-in, and signing in with a current code. Migration `0004` ran on PostgreSQL at startup. The CSV export button and the admin reset were covered by tests only, not clicked through in the browser. A one-case live AI run was refused by the OpenAI quota.
+
 ### Recent changes (2026-11-15 to 2026-11-16)
 
 A full code review found and fixed the following, and the features after it were then added:
@@ -332,15 +385,15 @@ A full code review found and fixed the following, and the features after it were
 
 ### Known gaps (not yet implemented)
 
-- **Sign-in hardening:** there is no multi-factor authentication, no single sign-on, and no self-service "forgot password" (an admin resets it). The failed sign-in limit lives in server memory, so it resets on restart and does not cover multiple workers or attackers spread across many addresses. Use HTTPS in any shared deployment, since the token is sent on every request.
+- **Sign-in hardening:** two-step verification is optional per user (there is no setting to require it), there is no single sign-on, and no self-service "forgot password" (an admin resets it). Authenticator secrets are stored unencrypted in the database. The failed sign-in limit lives in server memory, so it resets on restart and does not cover multiple workers or attackers spread across many addresses. Use HTTPS in any shared deployment, since the token is sent on every request.
 - **OCR limits:** OCR quality is not measured, there is no image preview in the app (**View** opens the file), and uploads wait while OCR runs (up to 90 seconds for a long scan) instead of processing in the background. Local development needs Tesseract installed separately.
-- **Live AI accuracy:** `evaluate_ai.py` has not completed a run because of the OpenAI account's quota/rate limit.
+- **Live AI accuracy:** the 24-case benchmark and `evaluate_ai.py` are ready, but no live run has completed because of the OpenAI account's quota/rate limit (last tried 2026-11-16).
 - **Control catalog:** only 10 controls with short summaries, not the full NIST SP 800-53 text.
-- **Activity log limits:** evidence views/downloads and sign-outs are not logged. There is no retention policy, export, or tamper-evidence: a database administrator can still change rows directly.
-- **Frontend tests:** only the risk summary and search-highlighting logic have unit tests. Components and pages have no automated tests (that needs a test library such as Vitest, which requires a working npm install); UI behavior is checked manually in the browser.
+- **Activity log limits:** evidence views/downloads and sign-outs are not logged. There is no tamper-evidence: a database administrator can still change rows directly.
+- **Frontend tests:** the sign-in page, two-step settings, and risk summary have component tests. The larger pages (control assessment, evidence, systems, dashboard) do not, and there are no end-to-end browser tests; that behavior is checked manually in the browser.
 - **Risk summaries:** they are rule-based, not tailored narrative. They do not weigh a control's importance (every Not Met counts the same), use a likelihood/impact score, or compare against earlier assessments.
 - **Responsive polish:** pages fit phone width, but wide tables scroll horizontally and layouts have not been individually designed for mobile.
-- **Deployment:** Docker images and a compose file exist for running the app on one machine. There is no HTTPS setup, hosting target, image registry, or deployment pipeline, and no automated backups. The CI workflow has not yet run on GitHub.
+- **Deployment:** Docker images and a compose file exist for running the app on one machine. There is no HTTPS setup, hosting target, image registry, or deployment pipeline, and no automated backups.
 - **Search limits:** evidence search matches exact text, so it does not find word variants ("review" finds "reviewed", but "reviewed" does not find "review") or synonyms. There is no full-text index, so large collections will be slow.
 - **RAG:** evidence chunking, embeddings, and vector search are planned but not started. Until then, the AI receives whole files, and analysis is refused when a control's evidence exceeds 60,000 characters.
 

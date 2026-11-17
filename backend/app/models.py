@@ -329,10 +329,38 @@ class User(Base):
         nullable=False,
     )
 
+    # Authenticator-app secret (base32). Set only once MFA is turned on.
+    mfa_secret: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+
+    # Secret shown during setup, waiting for the first valid code.
+    mfa_pending_secret: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+
+    # Last accepted 30-second step, so a code cannot be replayed.
+    mfa_last_step: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
+    # JSON list of SHA-256 hashes of unused recovery codes.
+    mfa_recovery_codes: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
     sessions: Mapped[list["UserSession"]] = relationship(
         back_populates="user",
         cascade="all, delete-orphan",
     )
+
+    @property
+    def mfa_enabled(self) -> bool:
+        return bool(self.mfa_secret)
 
 
 class UserSession(Base):

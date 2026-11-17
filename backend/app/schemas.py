@@ -282,6 +282,8 @@ Role = Literal["admin", "analyst", "viewer"]
 class LoginRequest(BaseModel):
     username: str = Field(max_length=80)
     password: str = Field(max_length=256)
+    # Authenticator-app code or recovery code; needed once MFA is on.
+    code: str | None = Field(None, max_length=32)
 
 
 class UserCreate(BaseModel):
@@ -298,6 +300,8 @@ class SetupRequest(BaseModel):
 class UserUpdate(BaseModel):
     role: Role | None = None
     password: Password | None = None
+    # True turns off MFA for a user who lost their authenticator.
+    disableMfa: bool | None = None
 
 
 class PasswordChange(BaseModel):
@@ -309,6 +313,7 @@ class UserResponse(BaseModel):
     id: int
     username: str
     role: str
+    mfaEnabled: bool = Field(validation_alias="mfa_enabled")
 
     createdAt: datetime = Field(
         validation_alias="created_at"
@@ -338,6 +343,28 @@ class ActivityEventResponse(BaseModel):
         from_attributes=True,
         populate_by_name=True,
     )
+
+
+class MfaSetupRequest(BaseModel):
+    currentPassword: str = Field(max_length=256)
+
+
+class MfaSetupResponse(BaseModel):
+    secret: str
+    otpauthUri: str
+
+
+class MfaCode(BaseModel):
+    code: str = Field(min_length=1, max_length=32)
+
+
+class MfaConfirmRequest(BaseModel):
+    currentPassword: str = Field(max_length=256)
+    code: str = Field(min_length=1, max_length=32)
+
+
+class MfaRecoveryCodesResponse(BaseModel):
+    recoveryCodes: list[str]
 
 
 class AuthStatusResponse(BaseModel):

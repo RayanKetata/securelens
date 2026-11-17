@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -13,15 +14,20 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
-from .activity import control_label, record_activity
+from .activity import (
+    activity_csv,
+    control_label,
+    purge_expired_activity,
+    record_activity,
+)
 from .config import settings
-from .database import engine, get_db
+from .database import SessionLocal, engine, get_db
 from .migrate import upgrade_database
 from .evidence_text import (
     IMAGE_FORMATS,
@@ -47,7 +53,7 @@ from .auth import (
     too_many_attempts,
     verify_password,
 )
-from . import models, schemas
+from . import mfa, models, schemas
 
 
 logger = logging.getLogger("securelens")
@@ -116,6 +122,11 @@ app = FastAPI(
 # for example when several server processes start at once.
 if settings.auto_migrate:
     upgrade_database(engine)
+
+    # Apply the activity log retention period on startup too.
+    if settings.activity_retention_days > 0:
+        with SessionLocal() as startup_db:
+            purge_expired_activity(startup_db, settings.activity_retention_days)
 
 
 app.add_middleware(
@@ -411,9 +422,230 @@ def login(
             detail="Incorrect username or password.",
         )
 
+    if user.mfa_enabled:
+        if not request.code:
+            # The password was right; ask for the second factor. This
+            # is not counted as a failure, nor yet as a success.
+            return mfa_required("Enter the code from your authenticator app.")
+
+        method = check_second_factor(user, request.code)
+
+        if method is None:
+            login_throttle.record_failure(client, username)
+            record_activity(
+                db, user, "auth.mfa_failed",
+                "Entered a wrong authentication code", client=client,
+            )
+            db.commit()
+            return mfa_required("Incorrect or expired authentication code.")
+
+        if method == "recovery":
+            left = mfa.recovery_codes_left(user.mfa_recovery_codes)
+            record_activity(
+                db, user, "auth.mfa_recovery",
+                f"Signed in with a recovery code ({left} left)", client=client,
+            )
+
     login_throttle.record_success(client, username)
     record_activity(db, user, "auth.login", "Signed in", client=client)
     return login_response(db, user)
+
+
+def mfa_required(detail: str):
+    return JSONResponse(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        content={"detail": detail, "mfaRequired": True},
+    )
+
+
+def check_second_factor(user: models.User, code: str):
+    """Accept an authenticator code or an unused recovery code.
+
+    Returns "totp", "recovery", or None. Updates the user in memory;
+    the caller commits.
+    """
+    step = mfa.verify_code(user.mfa_secret, code, user.mfa_last_step)
+
+    if step is not None:
+        user.mfa_last_step = step
+        return "totp"
+
+    remaining = mfa.use_recovery_code(user.mfa_recovery_codes, code)
+
+    if remaining is not None:
+        user.mfa_recovery_codes = remaining
+        return "recovery"
+
+    return None
+
+
+def require_password_for(client: str, user: models.User, password: str):
+    """Re-check the password before a security change, with throttling."""
+    wait = login_throttle.retry_after(client, user.username)
+    if wait:
+        raise too_many_attempts(wait)
+
+    if not verify_password(password, user.password_hash):
+        login_throttle.record_failure(client, user.username)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Your current password is incorrect.",
+        )
+
+
+def require_second_factor(client: str, user: models.User, code: str):
+    if check_second_factor(user, code) is None:
+        login_throttle.record_failure(client, user.username)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Incorrect or expired authentication code.",
+        )
+
+
+def ensure_mfa(user: models.User, enabled: bool):
+    if user.mfa_enabled != enabled:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Multi-factor authentication is not on."
+                if enabled else
+                "Multi-factor authentication is already on."
+            ),
+        )
+
+
+def clear_mfa(user: models.User):
+    user.mfa_secret = None
+    user.mfa_pending_secret = None
+    user.mfa_last_step = None
+    user.mfa_recovery_codes = None
+
+
+@app.post(
+    "/auth/mfa/setup",
+    response_model=schemas.MfaSetupResponse,
+)
+def start_mfa_setup(
+    request: schemas.MfaSetupRequest,
+    http_request: Request,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_user),
+):
+    """Step 1: a new secret to add to an authenticator app."""
+    ensure_mfa(current_user, False)
+    require_password_for(
+        client_address(http_request), current_user, request.currentPassword,
+    )
+
+    secret = mfa.new_secret()
+    current_user.mfa_pending_secret = secret
+    db.commit()
+
+    return {
+        "secret": secret,
+        "otpauthUri": mfa.provisioning_uri(secret, current_user.username),
+    }
+
+
+@app.post(
+    "/auth/mfa/enable",
+    response_model=schemas.MfaRecoveryCodesResponse,
+)
+def enable_mfa(
+    request: schemas.MfaCode,
+    http_request: Request,
+    token: str = Depends(get_current_token),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_user),
+):
+    """Step 2: confirm with a first code; returns recovery codes once."""
+    ensure_mfa(current_user, False)
+
+    if not current_user.mfa_pending_secret:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Start setup first.",
+        )
+
+    client = client_address(http_request)
+    wait = login_throttle.retry_after(client, current_user.username)
+    if wait:
+        raise too_many_attempts(wait)
+
+    step = mfa.verify_code(current_user.mfa_pending_secret, request.code)
+
+    if step is None:
+        login_throttle.record_failure(client, current_user.username)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="That code is not right. Check the clock on your device and try the newest code.",
+        )
+
+    codes, hashes = mfa.new_recovery_codes()
+    current_user.mfa_secret = current_user.mfa_pending_secret
+    current_user.mfa_pending_secret = None
+    current_user.mfa_last_step = step
+    current_user.mfa_recovery_codes = hashes
+    # Sessions opened with only a password end; this one stays.
+    revoke_other_sessions(db, current_user, token)
+    record_activity(
+        db, current_user, "auth.mfa_enable",
+        "Turned on multi-factor authentication", client=client,
+    )
+    db.commit()
+
+    return {"recoveryCodes": codes}
+
+
+@app.post(
+    "/auth/mfa/disable",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def disable_own_mfa(
+    request: schemas.MfaConfirmRequest,
+    http_request: Request,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_user),
+):
+    ensure_mfa(current_user, True)
+    client = client_address(http_request)
+    require_password_for(client, current_user, request.currentPassword)
+    require_second_factor(client, current_user, request.code)
+
+    clear_mfa(current_user)
+    record_activity(
+        db, current_user, "auth.mfa_disable",
+        "Turned off multi-factor authentication", client=client,
+    )
+    db.commit()
+    return None
+
+
+@app.post(
+    "/auth/mfa/recovery-codes",
+    response_model=schemas.MfaRecoveryCodesResponse,
+)
+def regenerate_recovery_codes(
+    request: schemas.MfaConfirmRequest,
+    http_request: Request,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_user),
+):
+    """Replace all recovery codes; the old ones stop working."""
+    ensure_mfa(current_user, True)
+    client = client_address(http_request)
+    require_password_for(client, current_user, request.currentPassword)
+    require_second_factor(client, current_user, request.code)
+
+    codes, hashes = mfa.new_recovery_codes()
+    current_user.mfa_recovery_codes = hashes
+    record_activity(
+        db, current_user, "auth.mfa_recovery_codes",
+        "Created new recovery codes", client=client,
+    )
+    db.commit()
+
+    return {"recoveryCodes": codes}
 
 
 @app.post(
@@ -596,6 +828,14 @@ def update_user(
         # A password reset signs the user out everywhere.
         user.sessions.clear()
 
+    if request.disableMfa and user.mfa_enabled:
+        clear_mfa(user)
+        record_activity(
+            db, current_user, "user.update",
+            f"Turned off multi-factor authentication for {user.username}",
+        )
+        user.sessions.clear()
+
     db.commit()
     db.refresh(user)
 
@@ -647,6 +887,7 @@ def list_activity(
     current_user: models.User = Depends(require_admin),
 ):
     """Newest first. Pass the last id you received as `before` for more."""
+    purge_expired_activity(db, settings.activity_retention_days)
     statement = select(models.ActivityEvent)
 
     if before is not None:
@@ -660,6 +901,49 @@ def list_activity(
     return db.scalars(
         statement.order_by(models.ActivityEvent.id.desc()).limit(limit)
     ).all()
+
+
+@app.get(
+    "/activity/export",
+    response_class=Response,
+    responses={200: {"content": {"text/csv": {}}}},
+)
+def export_activity(
+    days: int | None = Query(None, ge=1, le=3650),
+    category: str | None = Query(None, max_length=20, pattern=r"^[a-z]+$"),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_admin),
+):
+    """The activity log as CSV, oldest first, for auditors or archiving."""
+    purge_expired_activity(db, settings.activity_retention_days)
+    statement = select(models.ActivityEvent)
+
+    if days is not None:
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        statement = statement.where(models.ActivityEvent.occurred_at >= since)
+
+    if category:
+        statement = statement.where(
+            models.ActivityEvent.action.startswith(category + ".")
+        )
+
+    events = db.scalars(statement.order_by(models.ActivityEvent.id)).all()
+
+    record_activity(
+        db, current_user, "activity.export",
+        f"Exported {len(events)} activity log entries",
+    )
+    db.commit()
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return Response(
+        content=activity_csv(events),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="securelens-activity-{stamp}.csv"',
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 # ---------------------------------------------------------

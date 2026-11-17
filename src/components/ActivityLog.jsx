@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-import { getActivity } from "../services/api";
+import { downloadActivityCsv, getActivity } from "../services/api";
 
 const PAGE_SIZE = 50;
 
@@ -23,6 +23,7 @@ function formatDate(value) {
 /* Admin-only, read-only view of the activity log, newest first. */
 export default function ActivityLog() {
   const [category, setCategory] = useState("");
+  const [exporting, setExporting] = useState(false);
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -81,19 +82,43 @@ export default function ActivityLog() {
     }
   }
 
+  async function handleExport() {
+    setExporting(true);
+    setError("");
+
+    try {
+      await downloadActivityCsv({ category });
+    } catch (failure) {
+      setError(failure.message || "The activity log could not be exported.");
+    } finally {
+      setExporting(false);
+    }
+  }
+
   return (
     <section className="assessment-card">
       <div className="section-title-row">
         <h2>Activity Log</h2>
 
-        <button
-          type="button"
-          className="secondary-button"
-          onClick={refresh}
-          disabled={loading}
-        >
-          {loading ? "Loading..." : "Refresh"}
-        </button>
+        <div className="control-actions">
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={handleExport}
+            disabled={exporting}
+          >
+            {exporting ? "Exporting..." : "Export CSV"}
+          </button>
+
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={refresh}
+            disabled={loading}
+          >
+            {loading ? "Loading..." : "Refresh"}
+          </button>
+        </div>
       </div>
 
       <p>

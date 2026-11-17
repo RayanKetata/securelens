@@ -111,6 +111,11 @@ async function request(
   );
 
   if (!response.ok) {
+    const errorBody = await response
+      .clone()
+      .json()
+      .catch(() => null);
+
     const errorMessage =
       await readErrorMessage(response);
 
@@ -123,9 +128,11 @@ async function request(
       unauthorizedListeners.forEach((listener) => listener(errorMessage));
     }
 
-    throw new Error(
-      errorMessage
-    );
+    const error = new Error(errorMessage);
+    error.status = response.status;
+    // The password was right and a second factor is needed.
+    error.mfaRequired = Boolean(errorBody?.mfaRequired);
+    throw error;
   }
 
   if (response.status === 204) {
@@ -166,10 +173,10 @@ export function getAuthStatus() {
   return request("/auth/status");
 }
 
-export function login(username, password) {
+export function login(username, password, code) {
   return request("/auth/login", {
     method: "POST",
-    body: JSON.stringify({ username, password }),
+    body: JSON.stringify({ username, password, code: code || null }),
     skipUnauthorizedHandler: true,
   });
 }
@@ -199,6 +206,34 @@ export function changePassword(currentPassword, newPassword) {
   });
 }
 
+export function startMfaSetup(currentPassword) {
+  return request("/auth/mfa/setup", {
+    method: "POST",
+    body: JSON.stringify({ currentPassword }),
+  });
+}
+
+export function enableMfa(code) {
+  return request("/auth/mfa/enable", {
+    method: "POST",
+    body: JSON.stringify({ code }),
+  });
+}
+
+export function disableMfa(currentPassword, code) {
+  return request("/auth/mfa/disable", {
+    method: "POST",
+    body: JSON.stringify({ currentPassword, code }),
+  });
+}
+
+export function regenerateRecoveryCodes(currentPassword, code) {
+  return request("/auth/mfa/recovery-codes", {
+    method: "POST",
+    body: JSON.stringify({ currentPassword, code }),
+  });
+}
+
 export function getActivity({ before, category, limit = 50 } = {}, signal) {
   const params = new URLSearchParams({ limit: String(limit) });
 
@@ -206,6 +241,34 @@ export function getActivity({ before, category, limit = 50 } = {}, signal) {
   if (category) params.set("category", category);
 
   return request(`/activity?${params}`, { signal });
+}
+
+/*
+ * Download the activity log as CSV. The endpoint needs the session
+ * token, so the file is fetched here and saved from a blob URL.
+ */
+export async function downloadActivityCsv({ category } = {}) {
+  const params = new URLSearchParams();
+  if (category) params.set("category", category);
+  const query = params.toString();
+
+  const response = await fetch(
+    `${API_BASE_URL}/activity/export${query ? `?${query}` : ""}`,
+    { headers: authHeaders() }
+  );
+
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const disposition = response.headers.get("Content-Disposition") || "";
+  const filename =
+    disposition.match(/filename="([^"]+)"/)?.[1] || "securelens-activity.csv";
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(await response.blob());
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(link.href);
 }
 
 export function getUsers() {

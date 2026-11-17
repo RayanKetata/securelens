@@ -106,6 +106,21 @@ export default function UserManagement() {
     }
   }
 
+  function handleDisableMfa(user) {
+    const confirmed = window.confirm(
+      `Turn off two-step verification for "${user.username}"?\n\n` +
+      "Do this only after confirming who they are, for example when they lost their phone. " +
+      "They will be signed out and can then sign in with only their password."
+    );
+
+    if (confirmed) {
+      run(
+        () => updateUser(user.id, { disableMfa: true }),
+        `Two-step verification turned off for ${user.username}.`
+      );
+    }
+  }
+
   function handleDelete(user) {
     const confirmed = window.confirm(
       `Delete the account "${user.username}"?\n\nTheir name stays on past assessment history.`
@@ -143,6 +158,7 @@ export default function UserManagement() {
               <tr>
                 <th>Username</th>
                 <th>Role</th>
+                <th>Two-step</th>
                 <th></th>
               </tr>
             </thead>
@@ -170,6 +186,8 @@ export default function UserManagement() {
                     </select>
                   </td>
 
+                  <td>{user.mfaEnabled ? "On" : "Off"}</td>
+
                   <td>
                     <div className="control-actions">
                       <button
@@ -183,6 +201,17 @@ export default function UserManagement() {
                       >
                         Reset Password
                       </button>
+
+                      {user.mfaEnabled && user.id !== currentUser?.id && (
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          disabled={busy}
+                          onClick={() => handleDisableMfa(user)}
+                        >
+                          Turn Off Two-Step
+                        </button>
+                      )}
 
                       {user.id !== currentUser?.id && (
                         <button
